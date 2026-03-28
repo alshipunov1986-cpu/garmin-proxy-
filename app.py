@@ -19,7 +19,7 @@ def init_garmin():
     if not GARMIN_TOKENS:
         raise RuntimeError("GARMIN_TOKENS env variable is not set")
     client = Garmin()
-    client.loads(GARMIN_TOKENS)
+    client.garth.loads(GARMIN_TOKENS)
     return client
 
 
