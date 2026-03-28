@@ -1,4 +1,5 @@
 import os
+import json
 import datetime
 from functools import wraps
 
@@ -8,26 +9,32 @@ from garminconnect import Garmin
 app = Flask(__name__)
 
 API_KEY = os.environ.get("API_KEY", "")
-GARMIN_EMAIL = os.environ.get("GARMIN_EMAIL", "")
-GARMIN_PASSWORD = os.environ.get("GARMIN_PASSWORD", "")
+GARMIN_TOKENS = os.environ.get("GARMIN_TOKENS", "")
 
 _garmin_client = None
+
+
+def init_garmin():
+    """Init Garmin client from OAuth tokens stored in GARMIN_TOKENS env var."""
+    if not GARMIN_TOKENS:
+        raise RuntimeError("GARMIN_TOKENS env variable is not set")
+    client = Garmin()
+    client.loads(GARMIN_TOKENS)
+    return client
 
 
 def get_garmin():
     """Lazy-init Garmin client with session reuse."""
     global _garmin_client
     if _garmin_client is None:
-        _garmin_client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-        _garmin_client.login()
+        _garmin_client = init_garmin()
     return _garmin_client
 
 
-def relogin_garmin():
-    """Force re-login if session expired."""
+def reinit_garmin():
+    """Force re-init client (e.g. after token expiry)."""
     global _garmin_client
-    _garmin_client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-    _garmin_client.login()
+    _garmin_client = init_garmin()
     return _garmin_client
 
 
@@ -42,16 +49,19 @@ def require_api_key(f):
 
 
 def garmin_call(func):
-    """Call a Garmin API function with automatic re-login on session expiry."""
+    """Call a Garmin API function; retry once on failure."""
     try:
         return func(get_garmin())
     except Exception:
-        return func(relogin_garmin())
+        return func(reinit_garmin())
 
 
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "endpoints": ["/sleep", "/hrv", "/body-battery", "/activities", "/weekly-stats"]})
+    return jsonify({
+        "status": "ok",
+        "endpoints": ["/sleep", "/hrv", "/body-battery", "/activities", "/weekly-stats"]
+    })
 
 
 @app.route("/sleep")

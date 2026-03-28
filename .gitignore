@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.garth/
+tokens.json
+GARMIN_TOKENS.txt
+get_tokens*.py
+find_chrome_profile.py
+garmin-browser-auth.py
+extract_tokens_after_login.py
+launch_chrome_debug.bat
+login.sh
