@@ -1173,6 +1173,33 @@ def sheets_history():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/debug/fatsecret")
+@require_api_key
+def debug_fatsecret():
+    """Diagnose FatSecret connectivity: show server outbound IP + token attempt result."""
+    result = {}
+    # 1. Outbound IP
+    try:
+        ip_resp = requests.get("https://api.ipify.org?format=json", timeout=5)
+        result["outbound_ip"] = ip_resp.json().get("ip", ip_resp.text)
+    except Exception as e:
+        result["outbound_ip"] = f"error: {e}"
+    # 2. FatSecret token attempt
+    try:
+        resp = requests.post(
+            FS_TOKEN_URL,
+            data={"grant_type": "client_credentials", "scope": "basic"},
+            auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
+            timeout=10,
+        )
+        result["fs_token_status"] = resp.status_code
+        result["fs_token_body"]   = resp.text[:500]
+        result["fs_client_id_set"] = bool(FATSECRET_CLIENT_ID)
+    except Exception as e:
+        result["fs_token_error"] = str(e)
+    return jsonify(result)
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
