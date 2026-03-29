@@ -290,7 +290,24 @@ def all_today():
         if isinstance(bb, list) and len(bb) > 0:
             charged = sum(d.get("charged", 0) for d in bb if isinstance(d, dict))
             drained = sum(d.get("drained", 0) for d in bb if isinstance(d, dict))
-            result["body_battery"] = {"charged": charged, "drained": drained}
+            # Current level: last reading from today's stat list
+            current_level = None
+            for d in bb:
+                if isinstance(d, dict) and d.get("date") == date_today:
+                    stats = d.get("bodyBatteryStatList") or []
+                    if stats:
+                        current_level = stats[-1].get("bodyBatteryLevel")
+            wake_level = result.get("daily_stats", {}).get("body_battery_wake")
+            # "израсходовано" = wake_level - current_level (positive = used, negative = gained)
+            net_used = None
+            if wake_level is not None and current_level is not None:
+                net_used = wake_level - current_level
+            result["body_battery"] = {
+                "charged": charged,
+                "drained": drained,
+                "current_level": current_level,
+                "net_used_since_wake": net_used,  # >0 used, <0 recovered
+            }
         else:
             result["body_battery"] = bb
     except Exception as e:
