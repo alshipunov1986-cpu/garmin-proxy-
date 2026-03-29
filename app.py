@@ -43,6 +43,10 @@ def init_garmin():
         raise RuntimeError("GARMIN_TOKENS env variable is not set")
     client = Garmin()
     client.garth.loads(GARMIN_TOKENS)
+    # Restore display_name from garth profile (needed for stats/HR endpoints)
+    profile = client.garth.profile or {}
+    client.display_name = profile.get("displayName")
+    client.full_name = profile.get("fullName")
     return client
 
 
@@ -260,6 +264,26 @@ def all_today():
     except Exception as e:
         result["hrv"] = {"error": str(e)}
 
+    # Daily stats: steps, resting HR, intensity minutes, calories
+    try:
+        stats = garmin_call(lambda g: g.get_stats(date_yesterday))
+        result["daily_stats"] = {
+            "steps": stats.get("totalSteps"),
+            "distance_m": stats.get("totalDistanceMeters"),
+            "active_calories": stats.get("activeKilocalories"),
+            "bmr_calories": stats.get("bmrKilocalories"),
+            "floors_ascended": round(stats.get("floorsAscended", 0) or 0),
+            "moderate_intensity_min": stats.get("moderateIntensityMinutes"),
+            "vigorous_intensity_min": stats.get("vigorousIntensityMinutes"),
+            "resting_hr": stats.get("restingHeartRate"),
+            "resting_hr_7day_avg": stats.get("lastSevenDaysAvgRestingHeartRate"),
+            "avg_stress": stats.get("averageStressLevel"),
+            "max_stress": stats.get("maxStressLevel"),
+            "body_battery_wake": stats.get("bodyBatteryAtWakeTime"),
+        }
+    except Exception as e:
+        result["daily_stats"] = {"error": str(e)}
+
     # Body battery (yesterday to today)
     try:
         bb = garmin_call(lambda g: g.get_body_battery(date_yesterday, date_today))
@@ -310,6 +334,26 @@ def all_today():
         ]
     except Exception as e:
         result["recent_activities"] = {"error": str(e)}
+
+    # FatSecret nutrition diary (written by Chrome extension at 21:25)
+    try:
+        if os.path.exists(FS_DIARY_FILE):
+            with open(FS_DIARY_FILE, encoding="utf-8") as f:
+                fs_data = json.load(f)
+            # Only include if data is from today
+            if fs_data.get("date") == date_today:
+                result["nutrition"] = {
+                    "date": fs_data.get("date"),
+                    "total": fs_data.get("total"),
+                    "meals": fs_data.get("meals"),
+                    "updated_at": fs_data.get("updated_at"),
+                }
+            else:
+                result["nutrition"] = {"note": "No diary data for today yet", "last_date": fs_data.get("date")}
+        else:
+            result["nutrition"] = {"note": "Diary file not found — install Chrome extension"}
+    except Exception as e:
+        result["nutrition"] = {"error": str(e)}
 
     return jsonify(result)
 
