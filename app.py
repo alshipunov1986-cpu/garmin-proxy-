@@ -1,6 +1,8 @@
 import os
 import json
 import datetime
+import base64
+import requests
 from functools import wraps
 
 from flask import Flask, jsonify, request
@@ -114,6 +116,32 @@ def weekly_stats():
             "restingHeartRate": stats.get("restingHeartRate"),
         }
     return jsonify(results)
+
+
+@app.route("/debug-token")
+@require_api_key
+def debug_token():
+    token_prefix = GARMIN_TOKENS[:30] if GARMIN_TOKENS else "EMPTY"
+    token_len = len(GARMIN_TOKENS)
+    result = {"token_prefix": token_prefix, "token_len": token_len}
+    try:
+        decoded = json.loads(base64.b64decode(GARMIN_TOKENS))
+        oauth2 = decoded[1]
+        access_token = oauth2.get("access_token", "")
+        result["access_token_prefix"] = access_token[:30]
+        result["access_token_len"] = len(access_token)
+        result["expires_at"] = oauth2.get("expires_at")
+        import time
+        result["expired"] = time.time() > oauth2.get("expires_at", 0)
+        yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+        url = f"https://connectapi.garmin.com/wellness-service/wellness/dailySleepData/None?date={yesterday}&nonSleepBufferMinutes=60"
+        r = requests.get(url, headers={"Authorization": f"Bearer {access_token}", "User-Agent": "GCM-iOS-5.7.2.1"}, timeout=15)
+        result["direct_http_status"] = r.status_code
+        if r.status_code != 200:
+            result["direct_http_error"] = r.text[:200]
+    except Exception as e:
+        result["error"] = str(e)
+    return jsonify(result)
 
 
 if __name__ == "__main__":
