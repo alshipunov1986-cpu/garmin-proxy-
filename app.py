@@ -1193,8 +1193,17 @@ def debug_fatsecret():
             timeout=10,
         )
         result["fs_token_status"] = resp.status_code
-        result["fs_token_body"]   = resp.text[:500]
+        result["fs_token_body"]   = resp.text[:200]
         result["fs_client_id_set"] = bool(FATSECRET_CLIENT_ID)
+        # 3. Test search call
+        if resp.status_code == 200:
+            token = resp.json().get("access_token", "")
+            sr = requests.get(FS_API_URL, params={
+                "method": "foods.search", "format": "json",
+                "search_expression": "chicken", "max_results": 3
+            }, headers={"Authorization": f"Bearer {token}"}, timeout=15)
+            result["search_status"] = sr.status_code
+            result["search_raw"] = sr.text[:600]
     except Exception as e:
         result["fs_token_error"] = str(e)
     return jsonify(result)
