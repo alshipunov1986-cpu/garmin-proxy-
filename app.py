@@ -806,6 +806,8 @@ def food_search():
         r = requests.get(off_url, params={
             "search_terms": q, "json": 1, "page_size": 8,
             "fields": "product_name,brands,nutriments",
+        }, headers={
+            "User-Agent": "GarminHealthProxy/1.0 (health tracker app; contact al.shipunov1986@gmail.com)"
         }, timeout=10)
         products = r.json().get("products", [])
         for p in products:
@@ -1172,41 +1174,6 @@ def sheets_history():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-@app.route("/debug/fatsecret")
-@require_api_key
-def debug_fatsecret():
-    """Diagnose FatSecret connectivity: show server outbound IP + token attempt result."""
-    result = {}
-    # 1. Outbound IP
-    try:
-        ip_resp = requests.get("https://api.ipify.org?format=json", timeout=5)
-        result["outbound_ip"] = ip_resp.json().get("ip", ip_resp.text)
-    except Exception as e:
-        result["outbound_ip"] = f"error: {e}"
-    # 2. FatSecret token attempt
-    try:
-        resp = requests.post(
-            FS_TOKEN_URL,
-            data={"grant_type": "client_credentials", "scope": "basic"},
-            auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
-            timeout=10,
-        )
-        result["fs_token_status"] = resp.status_code
-        result["fs_token_body"]   = resp.text[:200]
-        result["fs_client_id_set"] = bool(FATSECRET_CLIENT_ID)
-        # 3. Test search call
-        if resp.status_code == 200:
-            token = resp.json().get("access_token", "")
-            sr = requests.get(FS_API_URL, params={
-                "method": "foods.search", "format": "json",
-                "search_expression": "chicken", "max_results": 3
-            }, headers={"Authorization": f"Bearer {token}"}, timeout=15)
-            result["search_status"] = sr.status_code
-            result["search_raw"] = sr.text[:600]
-    except Exception as e:
-        result["fs_token_error"] = str(e)
-    return jsonify(result)
 
 
 if __name__ == "__main__":
