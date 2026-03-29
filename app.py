@@ -817,6 +817,212 @@ def food_diary_delete():
     return jsonify({"status": "ok", "total": data["total"]})
 
 
+# ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
+SPREADSHEET_ID   = "1bGEHnrvpCL6C_lwayP55W3oggNE4CKZQONOSeJLDCEc"
+SHEET_NAME       = "Health Data"
+CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), "google_credentials.json")
+
+SHEET_HEADERS = [
+    "Дата", "Сон (ч)", "Оценка сна", "Глубокий сон (мин)", "REM (мин)",
+    "HRV (мс)", "HRV норма недели", "Пульс покоя", "Пульс норма 7д",
+    "Body Battery утром", "Body Battery вечером", "Израсходовано BB",
+    "Стресс средний", "Стресс пик", "Шаги", "Активные калории",
+    "Температура кожи", "Тренировки", "SpO2",
+]
+
+_sheet_ws = None
+
+
+def get_sheet():
+    """Get authenticated Google Sheets worksheet (lazy init, cached)."""
+    global _sheet_ws
+    if _sheet_ws is not None:
+        return _sheet_ws
+    import gspread
+    if os.path.exists(CREDENTIALS_FILE):
+        gc = gspread.service_account(filename=CREDENTIALS_FILE)
+    else:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+        if not creds_json:
+            raise RuntimeError("Google credentials not found (google_credentials.json or GOOGLE_CREDENTIALS env var)")
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    # Get or create the worksheet
+    try:
+        ws = sh.worksheet(SHEET_NAME)
+    except Exception:
+        # Try renaming Sheet1 first, otherwise create new
+        try:
+            ws = sh.worksheet("Sheet1")
+            ws.update_title(SHEET_NAME)
+        except Exception:
+            ws = sh.add_worksheet(title=SHEET_NAME, rows=2000, cols=25)
+    # Ensure headers row exists
+    first_row = ws.row_values(1)
+    if not first_row or first_row[0] != SHEET_HEADERS[0]:
+        ws.update("A1", [SHEET_HEADERS])
+        ws.format("A1:S1", {"textFormat": {"bold": True}})
+    _sheet_ws = ws
+    return ws
+
+
+def _collect_day_data(date_str):
+    """Collect all health metrics for a given date. Returns a flat dict."""
+    d = {}
+
+    # Sleep (Garmin stores sleep under the wake-up date)
+    try:
+        sleep = garmin_call(lambda g: g.get_sleep_data(date_str))
+        sd = sleep.get("dailySleepDTO", {}) if isinstance(sleep, dict) else {}
+        d["sleep_hours"] = round(sd.get("sleepTimeSeconds", 0) / 3600, 2) if sd.get("sleepTimeSeconds") else None
+        scores = sd.get("sleepScores") or {}
+        d["sleep_score"] = scores.get("overall", {}).get("value") if isinstance(scores.get("overall"), dict) else None
+        d["deep_min"]   = round(sd.get("deepSleepSeconds", 0) / 60) if sd.get("deepSleepSeconds") else None
+        d["rem_min"]    = round(sd.get("remSleepSeconds", 0) / 60)  if sd.get("remSleepSeconds")  else None
+        d["skin_temp"]  = sleep.get("avgSkinTempDeviationC")
+    except Exception:
+        d.update({"sleep_hours": None, "sleep_score": None, "deep_min": None, "rem_min": None, "skin_temp": None})
+
+    # HRV
+    try:
+        hrv = garmin_call(lambda g: g.get_hrv_data(date_str))
+        hs = hrv.get("hrvSummary", {}) if isinstance(hrv, dict) else {}
+        d["hrv"]          = hs.get("lastNight")
+        d["hrv_weekly"]   = hs.get("weeklyAvg")
+    except Exception:
+        d.update({"hrv": None, "hrv_weekly": None})
+
+    # Daily stats (steps, HR, stress, body battery wake)
+    try:
+        stats = garmin_call(lambda g: g.get_stats(date_str))
+        d["resting_hr"]      = stats.get("restingHeartRate")
+        d["resting_hr_7d"]   = stats.get("lastSevenDaysAvgRestingHeartRate")
+        d["bb_wake"]         = stats.get("bodyBatteryAtWakeTime")
+        d["avg_stress"]      = stats.get("averageStressLevel")
+        d["max_stress"]      = stats.get("maxStressLevel")
+        d["steps"]           = stats.get("totalSteps")
+        d["active_calories"] = stats.get("activeKilocalories")
+    except Exception:
+        d.update({"resting_hr": None, "resting_hr_7d": None, "bb_wake": None,
+                  "avg_stress": None, "max_stress": None, "steps": None, "active_calories": None})
+
+    # Body battery — current level + net used since wake
+    try:
+        prev = (datetime.date.fromisoformat(date_str) - datetime.timedelta(days=1)).isoformat()
+        bb = garmin_call(lambda g: g.get_body_battery(prev, date_str))
+        current_level = None
+        if isinstance(bb, list):
+            for item in bb:
+                if isinstance(item, dict) and item.get("date") == date_str:
+                    sl = item.get("bodyBatteryStatList") or []
+                    if sl:
+                        current_level = sl[-1].get("bodyBatteryLevel")
+        d["bb_current"]  = current_level
+        bb_wake = d.get("bb_wake")
+        d["bb_net_used"] = (bb_wake - current_level) if (bb_wake is not None and current_level is not None) else None
+    except Exception:
+        d.update({"bb_current": None, "bb_net_used": None})
+
+    # Activities
+    try:
+        prev = (datetime.date.fromisoformat(date_str) - datetime.timedelta(days=1)).isoformat()
+        acts = garmin_call(lambda g: g.get_activities_by_date(prev, date_str)[:5])
+        d["workouts"] = ", ".join(
+            a.get("activityType", {}).get("typeKey", "?") for a in (acts or [])
+        )
+    except Exception:
+        d["workouts"] = ""
+
+    # SpO2
+    try:
+        spo2 = garmin_call(lambda g: g.get_spo2_data(date_str))
+        if isinstance(spo2, dict):
+            d["spo2"] = spo2.get("averageSpo2") or spo2.get("latestSpo2")
+        else:
+            d["spo2"] = None
+    except Exception:
+        d["spo2"] = None
+
+    return d
+
+
+def _day_data_to_row(date_str, d):
+    """Map collected data dict → sheet row list (matches SHEET_HEADERS order)."""
+    return [
+        date_str,
+        d.get("sleep_hours"),
+        d.get("sleep_score"),
+        d.get("deep_min"),
+        d.get("rem_min"),
+        d.get("hrv"),
+        d.get("hrv_weekly"),
+        d.get("resting_hr"),
+        d.get("resting_hr_7d"),
+        d.get("bb_wake"),
+        d.get("bb_current"),
+        d.get("bb_net_used"),
+        d.get("avg_stress"),
+        d.get("max_stress"),
+        d.get("steps"),
+        d.get("active_calories"),
+        d.get("skin_temp"),
+        d.get("workouts"),
+        d.get("spo2"),
+    ]
+
+
+@app.route("/sheets/save-day", methods=["GET", "POST"])
+@require_api_key
+def sheets_save_day():
+    """Collect Garmin data for a date and save/update a row in Google Sheets.
+    ?date=YYYY-MM-DD (default: yesterday)
+    """
+    date_str = request.args.get("date", yesterday())
+    try:
+        ws = get_sheet()
+        # Find existing row for this date
+        dates_col = ws.col_values(1)  # column A = Дата
+        try:
+            row_idx = dates_col.index(date_str) + 1  # 1-based
+            row_exists = True
+        except ValueError:
+            row_idx = None
+            row_exists = False
+
+        data = _collect_day_data(date_str)
+        row  = _day_data_to_row(date_str, data)
+
+        if row_exists:
+            ws.update(f"A{row_idx}", [row], value_input_option="USER_ENTERED")
+            action = "updated"
+        else:
+            ws.append_row(row, value_input_option="USER_ENTERED")
+            row_idx = len(dates_col) + 1
+            action = "appended"
+
+        return jsonify({"status": "ok", "date": date_str, "action": action, "row": row_idx, "data": data})
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()[-500:]}), 500
+
+
+@app.route("/sheets/history")
+@require_api_key
+def sheets_history():
+    """Return last N days from Google Sheets as JSON.
+    ?days=30 (default: 30)
+    """
+    days = int(request.args.get("days", 30))
+    try:
+        ws = get_sheet()
+        all_rows = ws.get_all_records()
+        cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+        filtered = [r for r in all_rows if str(r.get("Дата", "")) >= cutoff]
+        return jsonify({"days": days, "count": len(filtered), "data": filtered})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

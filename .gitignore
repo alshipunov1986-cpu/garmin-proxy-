@@ -4,6 +4,8 @@ __pycache__/
 .garth/
 tokens.json
 GARMIN_TOKENS.txt
+google_credentials.json
+elaborate-scope-491716-m2-c177bcb966ca.json
 get_tokens*.py
 find_chrome_profile.py
 garmin-browser-auth.py
