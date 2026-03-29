@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import datetime
 import base64
 import time
@@ -11,10 +12,25 @@ from garminconnect import Garmin
 
 app = Flask(__name__)
 
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+
+@app.route("/fatsecret/update", methods=["OPTIONS"])
+def fatsecret_update_preflight():
+    return "", 204
+
 API_KEY = os.environ.get("API_KEY", "")
 GARMIN_TOKENS = os.environ.get("GARMIN_TOKENS", "")
 FATSECRET_CLIENT_ID = os.environ.get("FATSECRET_CLIENT_ID", "")
 FATSECRET_CLIENT_SECRET = os.environ.get("FATSECRET_CLIENT_SECRET", "")
+FATSECRET_USER = os.environ.get("FATSECRET_USER", "")
+FATSECRET_PASS = os.environ.get("FATSECRET_PASS", "")
 
 _fs_token_cache = {"token": None, "expires_at": 0}
 
@@ -298,16 +314,12 @@ def all_today():
     return jsonify(result)
 
 
-# ── FATSECRET OAuth 1.0a ──────────────────────────────────────────────────────
-from requests_oauthlib import OAuth1Session
-
-FS_REQUEST_TOKEN_URL = "https://www.fatsecret.com/oauth/request_token"
-FS_AUTHORIZE_URL     = "https://www.fatsecret.com/oauth/authorize"
-FS_ACCESS_TOKEN_URL  = "https://www.fatsecret.com/oauth/access_token"
-FS_API_URL           = "https://platform.fatsecret.com/rest/server.api"
-FS_TOKEN_FILE        = os.path.join(os.path.dirname(__file__), "fatsecret_token.json")
-
-_fs_oauth_temp = {}  # stores request_token during auth flow
+# ── FATSECRET OAuth 2.0 Authorization Code ────────────────────────────────────
+FS_AUTHORIZE_URL = "https://oauth.fatsecret.com/connect/authorize"
+FS_TOKEN_URL     = "https://oauth.fatsecret.com/connect/token"
+FS_API_URL       = "https://platform.fatsecret.com/rest/server.api"
+FS_TOKEN_FILE    = os.path.join(os.path.dirname(__file__), "fatsecret_token.json")
+FS_CALLBACK_URL  = "https://lenovo-15.tail1309d4.ts.net/fatsecret/auth/callback"
 
 
 def load_fs_token():
@@ -320,59 +332,76 @@ def load_fs_token():
     return None
 
 
-def save_fs_token(token):
+def save_fs_token(data):
+    data["saved_at"] = time.time()
     with open(FS_TOKEN_FILE, "w") as f:
-        json.dump(token, f)
+        json.dump(data, f)
 
 
-def fs_session():
+def get_fs_access_token():
+    """Return valid access token, refreshing if needed."""
     t = load_fs_token()
     if not t:
         raise RuntimeError("FatSecret не авторизован. Откройте /fatsecret/auth/start")
-    return OAuth1Session(
-        FATSECRET_CLIENT_ID,
-        client_secret=FATSECRET_CLIENT_SECRET,
-        resource_owner_key=t["oauth_token"],
-        resource_owner_secret=t["oauth_token_secret"],
-    )
+    if time.time() > t.get("saved_at", 0) + t.get("expires_in", 3600) - 60:
+        resp = requests.post(
+            FS_TOKEN_URL,
+            data={"grant_type": "refresh_token", "refresh_token": t.get("refresh_token"),
+                  "scope": "basic"},
+            auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
+            timeout=10,
+        )
+        resp.raise_for_status()
+        new_t = resp.json()
+        save_fs_token(new_t)
+        return new_t["access_token"]
+    return t["access_token"]
 
 
 def fs_api_call(method, extra_params=None):
-    session = fs_session()
+    token = get_fs_access_token()
     params = {"method": method, "format": "json"}
     if extra_params:
         params.update(extra_params)
-    resp = session.get(FS_API_URL, params=params, timeout=15)
+    resp = requests.get(
+        FS_API_URL,
+        params=params,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
     return resp.json()
 
 
 @app.route("/fatsecret/auth/start")
 def fatsecret_auth_start():
-    """Step 1: get request token, redirect user to FatSecret authorize page."""
-    oauth = OAuth1Session(FATSECRET_CLIENT_ID, client_secret=FATSECRET_CLIENT_SECRET,
-                          callback_uri="http://127.0.0.1:5001/fatsecret/auth/callback")
-    tokens = oauth.fetch_request_token(FS_REQUEST_TOKEN_URL)
-    _fs_oauth_temp["oauth_token"] = tokens["oauth_token"]
-    _fs_oauth_temp["oauth_token_secret"] = tokens["oauth_token_secret"]
-    auth_url = oauth.authorization_url(FS_AUTHORIZE_URL)
-    return redirect(auth_url)
+    """Redirect browser to FatSecret OAuth2 authorization page."""
+    import urllib.parse
+    params = {
+        "response_type": "code",
+        "client_id": FATSECRET_CLIENT_ID,
+        "redirect_uri": FS_CALLBACK_URL,
+        "scope": "basic",
+    }
+    url = FS_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
+    return redirect(url)
 
 
 @app.route("/fatsecret/auth/callback")
 def fatsecret_auth_callback():
-    """Step 2: exchange verifier for access token, save to file."""
-    verifier = request.args.get("oauth_verifier")
-    if not verifier:
-        return jsonify({"error": "No oauth_verifier in callback", "args": dict(request.args)}), 400
-    oauth = OAuth1Session(
-        FATSECRET_CLIENT_ID,
-        client_secret=FATSECRET_CLIENT_SECRET,
-        resource_owner_key=_fs_oauth_temp.get("oauth_token"),
-        resource_owner_secret=_fs_oauth_temp.get("oauth_token_secret"),
-        verifier=verifier,
+    """Exchange authorization code for access+refresh tokens."""
+    code = request.args.get("code")
+    if not code:
+        return jsonify({"error": "No code in callback", "args": dict(request.args)}), 400
+    resp = requests.post(
+        FS_TOKEN_URL,
+        data={"grant_type": "authorization_code", "code": code,
+              "redirect_uri": FS_CALLBACK_URL, "scope": "basic"},
+        auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
+        timeout=10,
     )
-    tokens = oauth.fetch_access_token(FS_ACCESS_TOKEN_URL)
-    save_fs_token(tokens)
+    if resp.status_code != 200:
+        return jsonify({"error": resp.text, "status": resp.status_code}), 500
+    save_fs_token(resp.json())
     return jsonify({"status": "ok", "message": "✅ FatSecret авторизован! Токен сохранён."})
 
 
@@ -404,6 +433,129 @@ def fatsecret_search():
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+FS_DIARY_FILE  = os.path.join(os.path.dirname(__file__), "fatsecret_diary.json")
+FS_LOGIN_URL   = "https://foods.fatsecret.com/Auth.aspx?pa=s"
+FS_DIARY_URL   = "https://foods.fatsecret.com/Diary.aspx?pa=fj"
+_FS_BROWSER    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+
+def _fs_parse_diary(html):
+    """Parse FatSecret diary HTML → nutrition dict."""
+    import re
+    text = re.sub(r'<[^>]+>', ' ', html)   # strip tags
+    text = re.sub(r'[ \t]+', ' ', text)
+
+    total = None
+    m = re.search(r'([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s', text)
+    if m:
+        total = {"fat": float(m[1]), "carbs": float(m[2]),
+                 "protein": float(m[3]), "calories": int(m[4])}
+
+    meals = {}
+    for meal_m in re.finditer(
+            r'(Breakfast|Lunch|Dinner|Snacks/Other)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)',
+            text):
+        meals[meal_m[1].lower()] = {
+            "fat": float(meal_m[2]), "carbs": float(meal_m[3]),
+            "protein": float(meal_m[4]), "calories": int(meal_m[5])
+        }
+
+    date_m = re.search(r'Today,\s+\w+\s+(\d+\s+\w+\s+\d{4})', text)
+    return {
+        "date": date_m.group(1) if date_m else str(datetime.date.today()),
+        "total": total,
+        "meals": meals,
+    }
+
+
+def _fs_scrape():
+    """Login to FatSecret and scrape today's diary. Returns parsed dict."""
+    if not FATSECRET_USER or not FATSECRET_PASS:
+        raise RuntimeError("FATSECRET_USER / FATSECRET_PASS env vars not set")
+
+    session = requests.Session()
+    session.headers["User-Agent"] = _FS_BROWSER
+
+    # Step 1: GET login page → extract VIEWSTATE
+    login_page = session.get(FS_LOGIN_URL, timeout=15)
+    login_page.raise_for_status()
+
+    vs_m  = re.search(r'id="__VIEWSTATE"\s+value="([^"]+)"', login_page.text)
+    vsg_m = re.search(r'id="__VIEWSTATEGENERATOR"\s+value="([^"]+)"', login_page.text)
+    ev_m  = re.search(r'id="__EVENTVALIDATION"\s+value="([^"]+)"', login_page.text)
+
+    # Step 2: POST credentials
+    login_data = {
+        "__EVENTTARGET": "",
+        "__EVENTARGUMENT": "",
+        "__VIEWSTATE": vs_m.group(1) if vs_m else "",
+        "__VIEWSTATEGENERATOR": vsg_m.group(1) if vsg_m else "",
+        "__EVENTVALIDATION": ev_m.group(1) if ev_m else "",
+        "ctl00$ctl11$Logincontrol1$Name": FATSECRET_USER,
+        "ctl00$ctl11$Logincontrol1$Password": FATSECRET_PASS,
+        "ctl00$ctl11$Logincontrol1$Login": "Log In",
+    }
+    login_resp = session.post(FS_LOGIN_URL, data=login_data,
+                              timeout=15, allow_redirects=True)
+    if "Sign out" not in login_resp.text and "sign out" not in login_resp.text.lower():
+        raise RuntimeError("FatSecret login failed — check credentials")
+
+    # Step 3: GET diary
+    diary_resp = session.get(FS_DIARY_URL, timeout=15)
+    diary_resp.raise_for_status()
+    return _fs_parse_diary(diary_resp.text)
+
+
+@app.route("/fatsecret/update", methods=["POST"])
+def fatsecret_update():
+    """Receive nutrition data from bookmarklet and save to file."""
+    data = request.get_json(force=True)
+    if not data:
+        return jsonify({"error": "No JSON body"}), 400
+    data["updated_at"] = datetime.date.today().isoformat()
+    with open(FS_DIARY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    return jsonify({"status": "ok", "saved": data["updated_at"]})
+
+
+@app.route("/fatsecret/update-form", methods=["POST"])
+def fatsecret_update_form():
+    """Receive nutrition data via HTML form submit (bypasses CSP connect-src)."""
+    payload_str = request.form.get("payload") or request.data.decode()
+    if not payload_str:
+        return "error: no payload", 400
+    data = json.loads(payload_str)
+    data["updated_at"] = datetime.date.today().isoformat()
+    with open(FS_DIARY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    return "<html><body><script>window.close();</script><p>✅ FatSecret данные сохранены: " + data["updated_at"] + "</p></body></html>"
+
+
+@app.route("/fatsecret/sync")
+@require_api_key
+def fatsecret_sync():
+    """Login to FatSecret, scrape today's diary, save and return."""
+    try:
+        data = _fs_scrape()
+        data["updated_at"] = datetime.date.today().isoformat()
+        with open(FS_DIARY_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return jsonify(data)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/fatsecret/diary")
+@require_api_key
+def fatsecret_diary():
+    """Return today's saved nutrition data (last sync result)."""
+    if not os.path.exists(FS_DIARY_FILE):
+        return jsonify({"error": "No data yet. Call /fatsecret/sync first."}), 404
+    with open(FS_DIARY_FILE, encoding="utf-8") as f:
+        data = json.load(f)
+    return jsonify(data)
 
 
 # ── DEBUG TOKEN ───────────────────────────────────────────────────────────────

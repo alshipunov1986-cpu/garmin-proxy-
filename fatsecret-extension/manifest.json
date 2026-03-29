@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "FatSecret Daily Sync",
+  "version": "1.0",
+  "description": "Syncs FatSecret food diary to local health proxy at 21:25",
+  "permissions": [
+    "alarms",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://foods.fatsecret.com/*",
+    "http://127.0.0.1:5001/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "FatSecret Sync"
+  }
+}
