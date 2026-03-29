@@ -629,6 +629,177 @@ def debug_token():
     return jsonify(result)
 
 
+# ── FOOD PWA ──────────────────────────────────────────────────────────────────
+FOOD_APP_DIR   = os.path.join(os.path.dirname(__file__), "food_app")
+FOOD_CARDS_FILE = os.path.join(os.path.dirname(__file__), "food_cards.json")
+
+
+@app.route("/food")
+@app.route("/food/")
+def food_app():
+    from flask import send_from_directory
+    return send_from_directory(FOOD_APP_DIR, "index.html")
+
+
+@app.route("/food/search")
+def food_search():
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify([])
+    url = "https://world.openfoodfacts.org/cgi/search.pl"
+    params = {
+        "search_terms": q,
+        "json": 1,
+        "page_size": 10,
+        "fields": "product_name,brands,nutriments,serving_size",
+    }
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        products = r.json().get("products", [])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    results = []
+    for p in products:
+        n = p.get("nutriments", {})
+        kcal = n.get("energy-kcal_100g") or (n.get("energy_100g", 0) or 0) / 4.184
+        if not kcal:
+            continue
+        name = p.get("product_name", "").strip()
+        if not name:
+            continue
+        results.append({
+            "name": name,
+            "brand": p.get("brands", ""),
+            "per100": {
+                "calories": round(float(kcal), 1),
+                "protein":  round(float(n.get("proteins_100g", 0) or 0), 1),
+                "fat":      round(float(n.get("fat_100g", 0) or 0), 1),
+                "carbs":    round(float(n.get("carbohydrates_100g", 0) or 0), 1),
+            },
+        })
+    return jsonify(results)
+
+
+@app.route("/food/cards", methods=["GET", "POST", "DELETE", "OPTIONS"])
+def food_cards():
+    if request.method == "OPTIONS":
+        return "", 204
+    cards = {}
+    if os.path.exists(FOOD_CARDS_FILE):
+        with open(FOOD_CARDS_FILE, encoding="utf-8") as f:
+            cards = json.load(f)
+
+    if request.method == "GET":
+        return jsonify(cards)
+
+    elif request.method == "POST":
+        card = request.get_json(force=True)
+        if not card or not card.get("name"):
+            return jsonify({"error": "name required"}), 400
+        cards[card["name"]] = card
+        with open(FOOD_CARDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cards, f, ensure_ascii=False, indent=2)
+        return jsonify({"status": "ok"})
+
+    elif request.method == "DELETE":
+        name = request.args.get("name", "")
+        cards.pop(name, None)
+        with open(FOOD_CARDS_FILE, "w", encoding="utf-8") as f:
+            json.dump(cards, f, ensure_ascii=False, indent=2)
+        return jsonify({"status": "ok"})
+
+
+@app.route("/food/diary", methods=["GET", "POST"])
+def food_diary_api():
+    """GET: return diary entries. POST: add an entry."""
+    if request.method == "GET":
+        date = request.args.get("date", datetime.date.today().isoformat())
+        if os.path.exists(FS_DIARY_FILE):
+            with open(FS_DIARY_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("date") == date:
+                return jsonify(data)
+        return jsonify({"date": date, "entries": [], "total": None})
+
+    # POST — add food entry, recalculate totals, save
+    entry = request.get_json(force=True)
+    if not entry:
+        return jsonify({"error": "no body"}), 400
+
+    today = datetime.date.today().isoformat()
+    data = {"date": today, "entries": [], "total": None, "meals": {}}
+    if os.path.exists(FS_DIARY_FILE):
+        with open(FS_DIARY_FILE, encoding="utf-8") as f:
+            existing = json.load(f)
+        if existing.get("date") == today:
+            data = existing
+
+    data.setdefault("entries", [])
+    data["entries"].append(entry)
+
+    # Recalculate totals from entries
+    fat = carbs = protein = calories = 0.0
+    for e in data["entries"]:
+        factor = e.get("grams", 100) / 100.0
+        p = e.get("per100", {})
+        calories += (p.get("calories", 0) or 0) * factor
+        protein  += (p.get("protein",  0) or 0) * factor
+        fat      += (p.get("fat",      0) or 0) * factor
+        carbs    += (p.get("carbs",    0) or 0) * factor
+
+    data["total"] = {
+        "calories": round(calories, 1),
+        "protein":  round(protein,  1),
+        "fat":      round(fat,      1),
+        "carbs":    round(carbs,    1),
+    }
+    data["updated_at"] = datetime.datetime.now().isoformat()
+
+    with open(FS_DIARY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return jsonify({"status": "ok", "total": data["total"]})
+
+
+@app.route("/food/diary/delete", methods=["POST"])
+def food_diary_delete():
+    """Remove one entry by index."""
+    body = request.get_json(force=True) or {}
+    idx = body.get("index")
+    if idx is None:
+        return jsonify({"error": "index required"}), 400
+    today = datetime.date.today().isoformat()
+    if not os.path.exists(FS_DIARY_FILE):
+        return jsonify({"error": "no diary"}), 404
+    with open(FS_DIARY_FILE, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("date") != today:
+        return jsonify({"error": "diary date mismatch"}), 400
+    entries = data.get("entries", [])
+    if 0 <= idx < len(entries):
+        entries.pop(idx)
+    # Recalculate
+    fat = carbs = protein = calories = 0.0
+    for e in entries:
+        factor = e.get("grams", 100) / 100.0
+        p = e.get("per100", {})
+        calories += (p.get("calories", 0) or 0) * factor
+        protein  += (p.get("protein",  0) or 0) * factor
+        fat      += (p.get("fat",      0) or 0) * factor
+        carbs    += (p.get("carbs",    0) or 0) * factor
+    data["total"] = {
+        "calories": round(calories, 1),
+        "protein":  round(protein,  1),
+        "fat":      round(fat,      1),
+        "carbs":    round(carbs,    1),
+    }
+    data["entries"] = entries
+    with open(FS_DIARY_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    return jsonify({"status": "ok", "total": data["total"]})
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)

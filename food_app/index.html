@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Дневник питания</title>
+<link rel="manifest" href="data:application/json,%7B%22name%22%3A%22%D0%94%D0%BD%D0%B5%D0%B2%D0%BD%D0%B8%D0%BA+%D0%BF%D0%B8%D1%82%D0%B0%D0%BD%D0%B8%D1%8F%22%2C%22short_name%22%3A%22%D0%95%D0%B4%D0%B0%22%2C%22start_url%22%3A%22%2Ffood%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%23ffffff%22%2C%22theme_color%22%3A%22%232d7a2d%22%7D">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --green: #2d7a2d;
+    --green-dark: #1f5e1f;
+    --green-light: #e8f5e9;
+    --red: #c0392b;
+    --gray: #888;
+    --border: #e0e0e0;
+    --bg: #f7f7f7;
+    --card-bg: #fff;
+    --text: #222;
+    --safe-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    max-width: 480px;
+    margin: 0 auto;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* ── TOP BAR ── */
+  .topbar {
+    background: var(--green);
+    color: #fff;
+    padding: 12px 16px 10px;
+    font-size: 16px;
+    font-weight: 600;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .topbar-title { font-size: 16px; }
+  .topbar-date { font-size: 12px; opacity: .8; }
+
+  /* ── SCREENS ── */
+  .screen { display: none; flex: 1; overflow-y: auto; padding: 12px 12px 80px; }
+  .screen.active { display: block; }
+
+  /* ── BOTTOM NAV ── */
+  .nav {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    max-width: 480px;
+    margin: 0 auto;
+    background: #fff;
+    border-top: 1px solid var(--border);
+    display: flex;
+    padding-bottom: var(--safe-bottom);
+    z-index: 10;
+  }
+  .nav-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 8px 4px 6px;
+    border: none;
+    background: none;
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--gray);
+    gap: 2px;
+    transition: color .15s;
+  }
+  .nav-btn.active { color: var(--green); }
+  .nav-btn .icon { font-size: 22px; line-height: 1; }
+
+  /* ── CARDS ── */
+  .card {
+    background: var(--card-bg);
+    border-radius: 12px;
+    padding: 14px;
+    margin-bottom: 10px;
+    box-shadow: 0 1px 4px rgba(0,0,0,.07);
+  }
+
+  /* ── SEARCH ── */
+  .search-wrap {
+    position: sticky;
+    top: 0;
+    background: var(--bg);
+    padding: 4px 0 10px;
+    z-index: 5;
+  }
+  .search-input {
+    width: 100%;
+    padding: 11px 14px;
+    border: 1.5px solid var(--border);
+    border-radius: 10px;
+    font-size: 16px;
+    background: #fff;
+    outline: none;
+  }
+  .search-input:focus { border-color: var(--green); }
+
+  .result-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 11px 14px;
+    background: #fff;
+    border-radius: 10px;
+    margin-bottom: 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06);
+    cursor: pointer;
+    transition: background .12s;
+  }
+  .result-item:active { background: var(--green-light); }
+  .result-name { font-size: 14px; font-weight: 500; }
+  .result-brand { font-size: 12px; color: var(--gray); margin-top: 2px; }
+  .result-kcal { font-size: 13px; font-weight: 600; color: var(--green); white-space: nowrap; margin-left: 8px; }
+
+  .badge-mine {
+    display: inline-block;
+    font-size: 10px;
+    background: var(--green-light);
+    color: var(--green);
+    border-radius: 4px;
+    padding: 1px 5px;
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+
+  /* ── GRAMS MODAL ── */
+  .overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,.45);
+    z-index: 50;
+    align-items: flex-end;
+    justify-content: center;
+  }
+  .overlay.open { display: flex; }
+  .modal {
+    background: #fff;
+    border-radius: 18px 18px 0 0;
+    padding: 20px 20px calc(20px + var(--safe-bottom));
+    width: 100%;
+    max-width: 480px;
+  }
+  .modal h3 { font-size: 16px; margin-bottom: 14px; }
+  .modal-row { display: flex; gap: 10px; margin-bottom: 12px; }
+  .modal-input {
+    flex: 1;
+    padding: 11px 14px;
+    border: 1.5px solid var(--border);
+    border-radius: 10px;
+    font-size: 16px;
+    outline: none;
+  }
+  .modal-input:focus { border-color: var(--green); }
+  .modal-preview {
+    font-size: 13px;
+    color: var(--gray);
+    margin-bottom: 14px;
+    min-height: 18px;
+  }
+  .btn {
+    display: block;
+    width: 100%;
+    padding: 13px;
+    border: none;
+    border-radius: 10px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    background: var(--green);
+    color: #fff;
+    transition: background .15s;
+  }
+  .btn:active { background: var(--green-dark); }
+  .btn-outline {
+    background: none;
+    border: 1.5px solid var(--border);
+    color: var(--text);
+    margin-top: 8px;
+  }
+  .btn-outline:active { background: var(--border); }
+
+  /* ── DIARY ── */
+  .totals-bar {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .total-cell {
+    background: #fff;
+    border-radius: 10px;
+    padding: 10px 6px;
+    text-align: center;
+    box-shadow: 0 1px 3px rgba(0,0,0,.06);
+  }
+  .total-val { font-size: 18px; font-weight: 700; color: var(--green); }
+  .total-lbl { font-size: 10px; color: var(--gray); margin-top: 2px; }
+
+  .progress-wrap { margin-bottom: 12px; }
+  .progress-bar {
+    height: 8px;
+    background: var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--green);
+    border-radius: 4px;
+    transition: width .4s;
+  }
+  .progress-lbl { font-size: 11px; color: var(--gray); margin-top: 4px; text-align: right; }
+
+  .entry-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .entry-row:last-child { border-bottom: none; }
+  .entry-name { font-size: 14px; font-weight: 500; }
+  .entry-sub { font-size: 12px; color: var(--gray); margin-top: 2px; }
+  .entry-right { text-align: right; flex-shrink: 0; margin-left: 8px; }
+  .entry-kcal { font-size: 14px; font-weight: 600; }
+  .entry-macros { font-size: 11px; color: var(--gray); }
+  .del-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 18px;
+    color: #ccc;
+    padding: 2px 6px;
+    margin-left: 4px;
+  }
+  .del-btn:active { color: var(--red); }
+
+  .empty-msg { color: var(--gray); font-size: 14px; text-align: center; padding: 40px 0; }
+
+  /* ── MY CARDS ── */
+  .card-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 11px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .card-row:last-child { border-bottom: none; }
+  .card-name { font-size: 14px; font-weight: 500; }
+  .card-macros { font-size: 12px; color: var(--gray); margin-top: 2px; }
+  .add-fab {
+    position: fixed;
+    bottom: calc(62px + var(--safe-bottom) + 12px);
+    right: max(12px, calc(50vw - 240px + 12px));
+    width: 52px; height: 52px;
+    border-radius: 50%;
+    background: var(--green);
+    color: #fff;
+    font-size: 28px;
+    border: none;
+    box-shadow: 0 3px 10px rgba(0,0,0,.25);
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    z-index: 20;
+  }
+
+  /* ── ADD CARD MODAL ── */
+  .modal label { display: block; font-size: 13px; color: var(--gray); margin-bottom: 4px; margin-top: 10px; }
+  .macros-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+
+  /* ── SPINNER ── */
+  .spinner {
+    display: inline-block;
+    width: 18px; height: 18px;
+    border: 2.5px solid var(--border);
+    border-top-color: var(--green);
+    border-radius: 50%;
+    animation: spin .6s linear infinite;
+    vertical-align: middle;
+    margin-left: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .hint { font-size: 12px; color: var(--gray); margin: 6px 0 0; }
+
+  /* search section heading */
+  .section-label { font-size: 11px; color: var(--gray); text-transform: uppercase; letter-spacing: .5px; margin: 10px 0 6px; padding: 0 2px; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div>
+    <div class="topbar-title">🥗 Дневник питания</div>
+    <div class="topbar-date" id="topDate"></div>
+  </div>
+</div>
+
+<!-- ── SEARCH SCREEN ── -->
+<div class="screen active" id="screen-search">
+  <div class="search-wrap">
+    <input class="search-input" id="searchInput" type="search" placeholder="Поиск продукта…" autocomplete="off" autocorrect="off">
+  </div>
+  <div id="searchResults"></div>
+</div>
+
+<!-- ── DIARY SCREEN ── -->
+<div class="screen" id="screen-diary">
+  <div class="totals-bar" id="totalsBar">
+    <div class="total-cell"><div class="total-val" id="tCal">—</div><div class="total-lbl">ккал</div></div>
+    <div class="total-cell"><div class="total-val" id="tProt">—</div><div class="total-lbl">белки г</div></div>
+    <div class="total-cell"><div class="total-val" id="tFat">—</div><div class="total-lbl">жиры г</div></div>
+    <div class="total-cell"><div class="total-val" id="tCarbs">—</div><div class="total-lbl">углев г</div></div>
+  </div>
+  <div class="progress-wrap">
+    <div class="progress-bar"><div class="progress-fill" id="calsProgress" style="width:0%"></div></div>
+    <div class="progress-lbl" id="calsProgressLbl"></div>
+  </div>
+  <div class="card" id="diaryList"><div class="empty-msg">Нет записей за сегодня.<br>Добавьте еду через поиск.</div></div>
+</div>
+
+<!-- ── MY CARDS SCREEN ── -->
+<div class="screen" id="screen-cards">
+  <div class="card" id="cardsList"><div class="empty-msg">Нет сохранённых карточек.</div></div>
+</div>
+
+<!-- ── BOTTOM NAV ── -->
+<nav class="nav">
+  <button class="nav-btn active" onclick="showScreen('search')">
+    <span class="icon">🔍</span>Поиск
+  </button>
+  <button class="nav-btn" onclick="showScreen('diary')">
+    <span class="icon">📖</span>Дневник
+  </button>
+  <button class="nav-btn" onclick="showScreen('cards')">
+    <span class="icon">⭐</span>Мои
+  </button>
+</nav>
+
+<!-- FAB (only visible on cards screen) -->
+<button class="add-fab" id="fabAdd" style="display:none" onclick="openAddCard()">+</button>
+
+<!-- ── GRAMS MODAL ── -->
+<div class="overlay" id="gramsOverlay">
+  <div class="modal">
+    <h3 id="gramsTitle">Сколько грамм?</h3>
+    <div class="modal-row">
+      <input class="modal-input" id="gramsInput" type="number" inputmode="decimal" placeholder="100" min="1" max="5000">
+    </div>
+    <div class="modal-preview" id="gramsPreview"></div>
+    <button class="btn" id="gramsSave" onclick="confirmGrams()">Добавить в дневник</button>
+    <button class="btn btn-outline" onclick="closeModal('gramsOverlay')">Отмена</button>
+  </div>
+</div>
+
+<!-- ── ADD CARD MODAL ── -->
+<div class="overlay" id="cardOverlay">
+  <div class="modal">
+    <h3>Своя карточка</h3>
+    <label>Название</label>
+    <input class="modal-input" id="cardName" type="text" placeholder="Куриная грудка варёная" style="width:100%;margin-bottom:0">
+    <label>Ккал / 100г</label>
+    <input class="modal-input" id="cardCal" type="number" inputmode="decimal" placeholder="165" style="width:100%">
+    <div class="macros-grid" style="margin-top:10px">
+      <div>
+        <label>Белки г/100</label>
+        <input class="modal-input" id="cardProt" type="number" inputmode="decimal" placeholder="31">
+      </div>
+      <div>
+        <label>Жиры г/100</label>
+        <input class="modal-input" id="cardFat" type="number" inputmode="decimal" placeholder="3.6">
+      </div>
+      <div>
+        <label>Углев г/100</label>
+        <input class="modal-input" id="cardCarbs" type="number" inputmode="decimal" placeholder="0">
+      </div>
+    </div>
+    <button class="btn" style="margin-top:14px" onclick="saveCard()">Сохранить карточку</button>
+    <button class="btn btn-outline" onclick="closeModal('cardOverlay')">Отмена</button>
+  </div>
+</div>
+
+<script>
+// ── STATE ──────────────────────────────────────────────────────────────────
+const CALORIE_GOAL = 2000;
+let myCards = {};          // name → card object
+let diaryEntries = [];     // today's entries
+let diaryTotal = null;
+let selectedFood = null;   // food being added (for grams modal)
+
+// ── INIT ──────────────────────────────────────────────────────────────────
+document.getElementById("topDate").textContent = new Date().toLocaleDateString("ru-RU", {
+  weekday: "long", day: "numeric", month: "long"
+});
+
+loadCards();
+loadDiary();
+
+// Search on input (debounced)
+let searchTimer;
+document.getElementById("searchInput").addEventListener("input", e => {
+  clearTimeout(searchTimer);
+  const q = e.target.value.trim();
+  if (!q) { document.getElementById("searchResults").innerHTML = ""; return; }
+  searchTimer = setTimeout(() => doSearch(q), 350);
+});
+
+// ── NAVIGATION ────────────────────────────────────────────────────────────
+function showScreen(name) {
+  document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+  document.querySelectorAll(".nav-btn").forEach(b => b.classList.remove("active"));
+  document.getElementById("screen-" + name).classList.add("active");
+  document.querySelectorAll(".nav-btn")[{search:0,diary:1,cards:2}[name]].classList.add("active");
+  document.getElementById("fabAdd").style.display = name === "cards" ? "flex" : "none";
+  if (name === "diary") renderDiary();
+  if (name === "cards") renderCards();
+}
+
+// ── SEARCH ────────────────────────────────────────────────────────────────
+async function doSearch(q) {
+  const el = document.getElementById("searchResults");
+  el.innerHTML = '<div style="padding:16px;color:#888;font-size:14px">Ищу<span class="spinner"></span></div>';
+
+  // Local cards first
+  const localMatches = Object.values(myCards).filter(c =>
+    c.name.toLowerCase().includes(q.toLowerCase())
+  );
+
+  // OFF search
+  let offResults = [];
+  try {
+    const r = await fetch("/food/search?q=" + encodeURIComponent(q));
+    offResults = await r.json();
+    if (!Array.isArray(offResults)) offResults = [];
+  } catch (e) {
+    offResults = [];
+  }
+
+  let html = "";
+
+  if (localMatches.length) {
+    html += '<div class="section-label">Мои карточки</div>';
+    localMatches.forEach(c => {
+      html += resultHTML(c, true);
+    });
+  }
+
+  if (offResults.length) {
+    html += '<div class="section-label">Продукты</div>';
+    offResults.slice(0, 8).forEach(c => {
+      html += resultHTML(c, false);
+    });
+  }
+
+  // Add custom card shortcut
+  html += `<div class="hint" style="text-align:center;padding:14px 0">
+    Не нашли? <a href="#" onclick="openAddCardPrefill('${escHtml(q)}');return false"
+      style="color:var(--green);text-decoration:none">Добавить свою карточку</a>
+  </div>`;
+
+  el.innerHTML = html || '<div class="empty-msg">Ничего не найдено</div>';
+}
+
+function resultHTML(c, isMine) {
+  const kcal = c.per100?.calories ?? "?";
+  const brand = c.brand ? `<div class="result-brand">${escHtml(c.brand)}</div>` : "";
+  const mine = isMine ? '<span class="badge-mine">моя</span>' : "";
+  const data = escHtml(JSON.stringify(c));
+  return `<div class="result-item" onclick='pickFood(${data})'>
+    <div>
+      <div class="result-name">${escHtml(c.name)}${mine}</div>
+      ${brand}
+    </div>
+    <div class="result-kcal">${kcal} ккал</div>
+  </div>`;
+}
+
+function escHtml(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+
+// ── GRAMS MODAL ───────────────────────────────────────────────────────────
+function pickFood(food) {
+  selectedFood = food;
+  document.getElementById("gramsTitle").textContent = food.name;
+  document.getElementById("gramsInput").value = "100";
+  updateGramsPreview();
+  document.getElementById("gramsOverlay").classList.add("open");
+  setTimeout(() => document.getElementById("gramsInput").focus(), 80);
+}
+
+document.getElementById("gramsInput").addEventListener("input", updateGramsPreview);
+
+function updateGramsPreview() {
+  if (!selectedFood) return;
+  const g = parseFloat(document.getElementById("gramsInput").value) || 0;
+  const p = selectedFood.per100 || {};
+  const factor = g / 100;
+  const cal   = Math.round((p.calories || 0) * factor);
+  const prot  = Math.round((p.protein  || 0) * factor * 10) / 10;
+  const fat   = Math.round((p.fat      || 0) * factor * 10) / 10;
+  const carbs = Math.round((p.carbs    || 0) * factor * 10) / 10;
+  document.getElementById("gramsPreview").textContent =
+    `${g}г → ${cal} ккал | Б ${prot}г  Ж ${fat}г  У ${carbs}г`;
+}
+
+async function confirmGrams() {
+  const grams = parseFloat(document.getElementById("gramsInput").value);
+  if (!grams || grams <= 0) { alert("Введите количество грамм"); return; }
+  const btn = document.getElementById("gramsSave");
+  btn.disabled = true;
+  btn.textContent = "Сохраняю…";
+
+  const entry = {
+    name: selectedFood.name,
+    brand: selectedFood.brand || "",
+    grams,
+    per100: selectedFood.per100,
+  };
+
+  try {
+    const r = await fetch("/food/diary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(entry),
+    });
+    const data = await r.json();
+    if (data.status === "ok") {
+      diaryTotal = data.total;
+      await loadDiary();
+      closeModal("gramsOverlay");
+      showScreen("diary");
+    } else {
+      alert("Ошибка: " + (data.error || "неизвестно"));
+    }
+  } catch (e) {
+    alert("Ошибка сети: " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Добавить в дневник";
+  }
+}
+
+function closeModal(id) {
+  document.getElementById(id).classList.remove("open");
+}
+
+// ── DIARY ─────────────────────────────────────────────────────────────────
+async function loadDiary() {
+  try {
+    const r = await fetch("/food/diary");
+    const data = await r.json();
+    diaryEntries = data.entries || [];
+    diaryTotal = data.total || null;
+  } catch (e) {
+    diaryEntries = [];
+    diaryTotal = null;
+  }
+  renderDiary();
+}
+
+function renderDiary() {
+  const t = diaryTotal;
+  document.getElementById("tCal").textContent   = t ? Math.round(t.calories) : "—";
+  document.getElementById("tProt").textContent  = t ? Math.round(t.protein)  : "—";
+  document.getElementById("tFat").textContent   = t ? Math.round(t.fat)      : "—";
+  document.getElementById("tCarbs").textContent = t ? Math.round(t.carbs)    : "—";
+
+  const pct = t ? Math.min(100, Math.round(t.calories / CALORIE_GOAL * 100)) : 0;
+  document.getElementById("calsProgress").style.width = pct + "%";
+  document.getElementById("calsProgressLbl").textContent = t
+    ? `${Math.round(t.calories)} / ${CALORIE_GOAL} ккал (${pct}%)`
+    : `Цель: ${CALORIE_GOAL} ккал`;
+
+  const el = document.getElementById("diaryList");
+  if (!diaryEntries.length) {
+    el.innerHTML = '<div class="empty-msg">Нет записей за сегодня.<br>Добавьте еду через поиск.</div>';
+    return;
+  }
+
+  el.innerHTML = diaryEntries.map((e, i) => {
+    const factor = (e.grams || 100) / 100;
+    const p = e.per100 || {};
+    const cal   = Math.round((p.calories || 0) * factor);
+    const prot  = Math.round((p.protein  || 0) * factor * 10) / 10;
+    const fat   = Math.round((p.fat      || 0) * factor * 10) / 10;
+    const carbs = Math.round((p.carbs    || 0) * factor * 10) / 10;
+    return `<div class="entry-row">
+      <div style="flex:1">
+        <div class="entry-name">${escHtml(e.name)}</div>
+        <div class="entry-sub">${e.grams}г${e.brand ? " · " + escHtml(e.brand) : ""}</div>
+      </div>
+      <div class="entry-right">
+        <div class="entry-kcal">${cal} ккал</div>
+        <div class="entry-macros">Б${prot} Ж${fat} У${carbs}</div>
+      </div>
+      <button class="del-btn" onclick="deleteEntry(${i})" title="Удалить">✕</button>
+    </div>`;
+  }).join("");
+}
+
+async function deleteEntry(idx) {
+  if (!confirm("Удалить эту запись?")) return;
+  try {
+    const r = await fetch("/food/diary/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ index: idx }),
+    });
+    const data = await r.json();
+    if (data.status === "ok") {
+      diaryTotal = data.total;
+      await loadDiary();
+    }
+  } catch (e) {
+    alert("Ошибка: " + e.message);
+  }
+}
+
+// ── MY CARDS ──────────────────────────────────────────────────────────────
+async function loadCards() {
+  try {
+    const r = await fetch("/food/cards");
+    myCards = await r.json();
+  } catch (e) {
+    myCards = {};
+  }
+  renderCards();
+}
+
+function renderCards() {
+  const el = document.getElementById("cardsList");
+  const cards = Object.values(myCards);
+  if (!cards.length) {
+    el.innerHTML = '<div class="empty-msg">Нет сохранённых карточек.<br>Нажмите + чтобы добавить.</div>';
+    return;
+  }
+  el.innerHTML = cards.map(c => {
+    const p = c.per100 || {};
+    return `<div class="card-row">
+      <div style="flex:1">
+        <div class="card-name">${escHtml(c.name)}</div>
+        <div class="card-macros">${p.calories} ккал | Б${p.protein} Ж${p.fat} У${p.carbs} (на 100г)</div>
+      </div>
+      <button class="del-btn" onclick="deleteCard('${escHtml(c.name)}')" title="Удалить">✕</button>
+    </div>`;
+  }).join("");
+}
+
+function openAddCard() {
+  clearCardForm();
+  document.getElementById("cardOverlay").classList.add("open");
+  setTimeout(() => document.getElementById("cardName").focus(), 80);
+}
+
+function openAddCardPrefill(name) {
+  clearCardForm();
+  document.getElementById("cardName").value = name;
+  document.getElementById("cardOverlay").classList.add("open");
+  setTimeout(() => document.getElementById("cardCal").focus(), 80);
+}
+
+function clearCardForm() {
+  ["cardName","cardCal","cardProt","cardFat","cardCarbs"].forEach(id => {
+    document.getElementById(id).value = "";
+  });
+}
+
+async function saveCard() {
+  const name  = document.getElementById("cardName").value.trim();
+  const cal   = parseFloat(document.getElementById("cardCal").value);
+  const prot  = parseFloat(document.getElementById("cardProt").value) || 0;
+  const fat   = parseFloat(document.getElementById("cardFat").value)  || 0;
+  const carbs = parseFloat(document.getElementById("cardCarbs").value) || 0;
+
+  if (!name)  { alert("Введите название"); return; }
+  if (!cal)   { alert("Введите калории"); return; }
+
+  const card = {
+    name,
+    per100: {
+      calories: Math.round(cal * 10) / 10,
+      protein:  Math.round(prot  * 10) / 10,
+      fat:      Math.round(fat   * 10) / 10,
+      carbs:    Math.round(carbs * 10) / 10,
+    },
+  };
+
+  try {
+    await fetch("/food/cards", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(card),
+    });
+    await loadCards();
+    closeModal("cardOverlay");
+  } catch (e) {
+    alert("Ошибка: " + e.message);
+  }
+}
+
+async function deleteCard(name) {
+  if (!confirm(`Удалить "${name}"?`)) return;
+  try {
+    await fetch("/food/cards?name=" + encodeURIComponent(name), { method: "DELETE" });
+    await loadCards();
+  } catch (e) {
+    alert("Ошибка: " + e.message);
+  }
+}
+
+// Enter key in grams modal
+document.getElementById("gramsInput").addEventListener("keydown", e => {
+  if (e.key === "Enter") confirmGrams();
+});
+// Close modal on overlay click
+["gramsOverlay","cardOverlay"].forEach(id => {
+  document.getElementById(id).addEventListener("click", e => {
+    if (e.target === e.currentTarget) closeModal(id);
+  });
+});
+</script>
+</body>
+</html>
