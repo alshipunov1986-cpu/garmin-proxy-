@@ -860,7 +860,7 @@ def get_sheet():
     # Ensure headers row exists
     first_row = ws.row_values(1)
     if not first_row or first_row[0] != SHEET_HEADERS[0]:
-        ws.update("A1", [SHEET_HEADERS])
+        ws.update(range_name="A1", values=[SHEET_HEADERS])
         ws.format("A1:S1", {"textFormat": {"bold": True}})
     _sheet_ws = ws
     return ws
@@ -993,7 +993,7 @@ def sheets_save_day():
         row  = _day_data_to_row(date_str, data)
 
         if row_exists:
-            ws.update(f"A{row_idx}", [row], value_input_option="USER_ENTERED")
+            ws.update(values=[row], range_name=f"A{row_idx}", value_input_option="USER_ENTERED")
             action = "updated"
         else:
             ws.append_row(row, value_input_option="USER_ENTERED")
