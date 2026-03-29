@@ -233,6 +233,7 @@ def all_today():
     result = {}
     date_today = today()
     date_yesterday = yesterday()
+    result["date"] = date_today  # always explicit so n8n can verify
 
     # Sleep (last night = today's date in Garmin)
     try:
@@ -267,7 +268,7 @@ def all_today():
 
     # Daily stats: steps, resting HR, intensity minutes, calories
     try:
-        stats = garmin_call(lambda g: g.get_stats(date_yesterday))
+        stats = garmin_call(lambda g: g.get_stats(date_today))
         result["daily_stats"] = {
             "steps": stats.get("totalSteps"),
             "distance_m": stats.get("totalDistanceMeters"),
@@ -316,21 +317,21 @@ def all_today():
 
     # Stress
     try:
-        stress = garmin_call(lambda g: g.get_stress_data(date_yesterday))
+        stress = garmin_call(lambda g: g.get_stress_data(date_today))
         result["stress_timeline"] = stress
     except Exception as e:
         result["stress_timeline"] = {"error": str(e)}
 
     # Respiration
     try:
-        resp = garmin_call(lambda g: g.get_respiration_data(date_yesterday))
+        resp = garmin_call(lambda g: g.get_respiration_data(date_today))
         result["respiration"] = resp
     except Exception as e:
         result["respiration"] = {"error": str(e)}
 
     # SpO2
     try:
-        spo2 = garmin_call(lambda g: g.get_spo2_data(date_yesterday))
+        spo2 = garmin_call(lambda g: g.get_spo2_data(date_today))
         result["spo2"] = spo2
     except Exception as e:
         result["spo2"] = {"error": str(e)}
@@ -353,23 +354,37 @@ def all_today():
     except Exception as e:
         result["recent_activities"] = {"error": str(e)}
 
-    # FatSecret nutrition diary (written by Chrome extension at 21:25)
+    # Nutrition diary — PWA food_diary.json (primary) → fatsecret_diary.json (fallback)
     try:
-        if os.path.exists(FS_DIARY_FILE):
+        nutrition_data = None
+        # 1. Try new PWA diary (food_diary.json)
+        if os.path.exists(FOOD_DIARY_FILE):
+            with open(FOOD_DIARY_FILE, encoding="utf-8") as f:
+                all_diary = json.load(f)
+            # multi-day format: {date_str: {entries, total}}
+            if isinstance(all_diary, dict) and "entries" not in all_diary:
+                day_data = all_diary.get(date_today, {})
+                if day_data.get("total") and day_data["total"].get("calories", 0) > 0:
+                    nutrition_data = {
+                        "date":       date_today,
+                        "source":     "pwa",
+                        "total":      day_data.get("total"),
+                        "entries":    day_data.get("entries", []),
+                        "updated_at": day_data.get("updated_at", date_today),
+                    }
+        # 2. Fallback: old Chrome extension fatsecret_diary.json
+        if nutrition_data is None and os.path.exists(FS_DIARY_FILE):
             with open(FS_DIARY_FILE, encoding="utf-8") as f:
                 fs_data = json.load(f)
-            # Only include if data is from today
             if fs_data.get("date") == date_today:
-                result["nutrition"] = {
-                    "date": fs_data.get("date"),
-                    "total": fs_data.get("total"),
-                    "meals": fs_data.get("meals"),
+                nutrition_data = {
+                    "date":       fs_data.get("date"),
+                    "source":     "fatsecret_ext",
+                    "total":      fs_data.get("total"),
+                    "meals":      fs_data.get("meals"),
                     "updated_at": fs_data.get("updated_at"),
                 }
-            else:
-                result["nutrition"] = {"note": "No diary data for today yet", "last_date": fs_data.get("date")}
-        else:
-            result["nutrition"] = {"note": "Diary file not found — install Chrome extension"}
+        result["nutrition"] = nutrition_data or {"note": "No nutrition data for today yet"}
     except Exception as e:
         result["nutrition"] = {"error": str(e)}
 
