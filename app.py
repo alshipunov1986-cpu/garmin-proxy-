@@ -31,6 +31,7 @@ FATSECRET_CLIENT_ID = os.environ.get("FATSECRET_CLIENT_ID", "")
 FATSECRET_CLIENT_SECRET = os.environ.get("FATSECRET_CLIENT_SECRET", "")
 FATSECRET_USER = os.environ.get("FATSECRET_USER", "")
 FATSECRET_PASS = os.environ.get("FATSECRET_PASS", "")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 _fs_token_cache = {"token": None, "expires_at": 0}
 
@@ -382,6 +383,104 @@ FS_API_URL       = "https://platform.fatsecret.com/rest/server.api"
 FS_TOKEN_FILE    = os.path.join(os.path.dirname(__file__), "fatsecret_token.json")
 FS_CALLBACK_URL  = "https://lenovo-15.tail1309d4.ts.net/fatsecret/auth/callback"
 
+# client_credentials token cache (for public food search — no user login needed)
+_fs_cc_cache = {"token": None, "expires_at": 0}
+
+def get_fs_client_token():
+    """OAuth 2.0 client_credentials — for public food search (no user auth)."""
+    global _fs_cc_cache
+    if _fs_cc_cache["token"] and time.time() < _fs_cc_cache["expires_at"] - 60:
+        return _fs_cc_cache["token"]
+    resp = requests.post(
+        FS_TOKEN_URL,
+        data={"grant_type": "client_credentials", "scope": "basic"},
+        auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
+        timeout=10,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    _fs_cc_cache["token"] = data["access_token"]
+    _fs_cc_cache["expires_at"] = time.time() + data.get("expires_in", 3600)
+    return _fs_cc_cache["token"]
+
+def fs_public_call(method, extra_params=None):
+    """FatSecret API call using client_credentials (public data — food search)."""
+    token = get_fs_client_token()
+    params = {"method": method, "format": "json"}
+    if extra_params:
+        params.update(extra_params)
+    resp = requests.get(
+        FS_API_URL,
+        params=params,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
+    return resp.json()
+
+def parse_fs_food(food):
+    """Parse FatSecret food object → unified format {name, brand, source, per100}."""
+    import re
+    desc = food.get("food_description", "")
+    # "Per 100g - Calories: 165kcal | Fat: 3.57g | Carbs: 0.00g | Protein: 31.02g"
+    cal   = re.search(r'Calories:\s*([\d.]+)', desc)
+    fat   = re.search(r'Fat:\s*([\d.]+)',      desc)
+    carbs = re.search(r'Carbs:\s*([\d.]+)',    desc)
+    prot  = re.search(r'Protein:\s*([\d.]+)',  desc)
+    return {
+        "name":   food.get("food_name", "").strip(),
+        "brand":  food.get("brand_name", "").strip(),
+        "source": "fatsecret",
+        "per100": {
+            "calories": round(float(cal.group(1)),   1) if cal   else 0,
+            "protein":  round(float(prot.group(1)),  1) if prot  else 0,
+            "fat":      round(float(fat.group(1)),   1) if fat   else 0,
+            "carbs":    round(float(carbs.group(1)), 1) if carbs else 0,
+        },
+    }
+
+
+_translate_cache = {}
+
+def translate_food_query(q):
+    """
+    Detect Cyrillic input and translate to English using Claude Haiku.
+    Returns (translated_str, original_query) or (None, q) if no translation needed/possible.
+    """
+    if not any('\u0400' <= c <= '\u04FF' for c in q):
+        return None, q  # not Cyrillic — no translation needed
+    if not ANTHROPIC_API_KEY:
+        return None, q  # no key — fall through gracefully
+    if q in _translate_cache:
+        return _translate_cache[q], q
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5",
+                "max_tokens": 64,
+                "messages": [{
+                    "role": "user",
+                    "content": (
+                        "Переведи название продукта питания на английский язык. "
+                        "Верни ТОЛЬКО само название без пояснений, одной строкой. "
+                        f"Продукт: {q}"
+                    )
+                }]
+            },
+            timeout=8,
+        )
+        resp.raise_for_status()
+        translated = resp.json()["content"][0]["text"].strip().strip('"').strip("'")
+        _translate_cache[q] = translated
+        return translated, q
+    except Exception:
+        return None, q
+
 
 def load_fs_token():
     if os.path.exists(FS_TOKEN_FILE):
@@ -647,8 +746,9 @@ def debug_token():
 
 
 # ── FOOD PWA ──────────────────────────────────────────────────────────────────
-FOOD_APP_DIR   = os.path.join(os.path.dirname(__file__), "food_app")
+FOOD_APP_DIR    = os.path.join(os.path.dirname(__file__), "food_app")
 FOOD_CARDS_FILE = os.path.join(os.path.dirname(__file__), "food_cards.json")
+FOOD_DIARY_FILE = os.path.join(os.path.dirname(__file__), "food_diary.json")
 
 
 @app.route("/food")
@@ -662,40 +762,59 @@ def food_app():
 def food_search():
     q = request.args.get("q", "").strip()
     if not q:
-        return jsonify([])
-    url = "https://world.openfoodfacts.org/cgi/search.pl"
-    params = {
-        "search_terms": q,
-        "json": 1,
-        "page_size": 10,
-        "fields": "product_name,brands,nutriments,serving_size",
-    }
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        products = r.json().get("products", [])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"results": [], "translated": ""})
+
+    # ── 0. Detect Cyrillic → translate for FatSecret ──────────────────────────
+    translated_q, orig_q = translate_food_query(q)
+    fs_query = translated_q if translated_q else q
 
     results = []
-    for p in products:
-        n = p.get("nutriments", {})
-        kcal = n.get("energy-kcal_100g") or (n.get("energy_100g", 0) or 0) / 4.184
-        if not kcal:
-            continue
-        name = p.get("product_name", "").strip()
-        if not name:
-            continue
-        results.append({
-            "name": name,
-            "brand": p.get("brands", ""),
-            "per100": {
-                "calories": round(float(kcal), 1),
-                "protein":  round(float(n.get("proteins_100g", 0) or 0), 1),
-                "fat":      round(float(n.get("fat_100g", 0) or 0), 1),
-                "carbs":    round(float(n.get("carbohydrates_100g", 0) or 0), 1),
-            },
-        })
-    return jsonify(results)
+
+    # ── 1. FatSecret — search with translated query ───────────────────────────
+    try:
+        fs_data = fs_public_call("foods.search", {"search_expression": fs_query, "max_results": 8})
+        foods_wrap = fs_data.get("foods", {})
+        fs_foods = foods_wrap.get("food", [])
+        if isinstance(fs_foods, dict):   # single result → wrap in list
+            fs_foods = [fs_foods]
+        for f in fs_foods:
+            parsed = parse_fs_food(f)
+            if parsed["name"] and parsed["per100"]["calories"]:
+                results.append(parsed)
+    except Exception:
+        pass  # FatSecret unavailable — continue with OFF
+
+    # ── 2. Open Food Facts — search with original query (supports Cyrillic) ──
+    off_results = []
+    try:
+        off_url = "https://world.openfoodfacts.org/cgi/search.pl"
+        r = requests.get(off_url, params={
+            "search_terms": q, "json": 1, "page_size": 8,
+            "fields": "product_name,brands,nutriments",
+        }, timeout=10)
+        products = r.json().get("products", [])
+        for p in products:
+            n = p.get("nutriments", {})
+            kcal = n.get("energy-kcal_100g") or (n.get("energy_100g", 0) or 0) / 4.184
+            name = p.get("product_name", "").strip()
+            if not name or not kcal:
+                continue
+            off_results.append({
+                "name":   name,
+                "brand":  p.get("brands", ""),
+                "source": "off",
+                "per100": {
+                    "calories": round(float(kcal), 1),
+                    "protein":  round(float(n.get("proteins_100g",       0) or 0), 1),
+                    "fat":      round(float(n.get("fat_100g",            0) or 0), 1),
+                    "carbs":    round(float(n.get("carbohydrates_100g",  0) or 0), 1),
+                },
+            })
+    except Exception:
+        pass
+
+    results.extend(off_results)
+    return jsonify({"results": results, "translated": translated_q or ""})
 
 
 @app.route("/food/cards", methods=["GET", "POST", "DELETE", "OPTIONS"])
@@ -727,76 +846,7 @@ def food_cards():
         return jsonify({"status": "ok"})
 
 
-@app.route("/food/diary", methods=["GET", "POST"])
-def food_diary_api():
-    """GET: return diary entries. POST: add an entry."""
-    if request.method == "GET":
-        date = request.args.get("date", datetime.date.today().isoformat())
-        if os.path.exists(FS_DIARY_FILE):
-            with open(FS_DIARY_FILE, encoding="utf-8") as f:
-                data = json.load(f)
-            if data.get("date") == date:
-                return jsonify(data)
-        return jsonify({"date": date, "entries": [], "total": None})
-
-    # POST — add food entry, recalculate totals, save
-    entry = request.get_json(force=True)
-    if not entry:
-        return jsonify({"error": "no body"}), 400
-
-    today = datetime.date.today().isoformat()
-    data = {"date": today, "entries": [], "total": None, "meals": {}}
-    if os.path.exists(FS_DIARY_FILE):
-        with open(FS_DIARY_FILE, encoding="utf-8") as f:
-            existing = json.load(f)
-        if existing.get("date") == today:
-            data = existing
-
-    data.setdefault("entries", [])
-    data["entries"].append(entry)
-
-    # Recalculate totals from entries
-    fat = carbs = protein = calories = 0.0
-    for e in data["entries"]:
-        factor = e.get("grams", 100) / 100.0
-        p = e.get("per100", {})
-        calories += (p.get("calories", 0) or 0) * factor
-        protein  += (p.get("protein",  0) or 0) * factor
-        fat      += (p.get("fat",      0) or 0) * factor
-        carbs    += (p.get("carbs",    0) or 0) * factor
-
-    data["total"] = {
-        "calories": round(calories, 1),
-        "protein":  round(protein,  1),
-        "fat":      round(fat,      1),
-        "carbs":    round(carbs,    1),
-    }
-    data["updated_at"] = datetime.datetime.now().isoformat()
-
-    with open(FS_DIARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-    return jsonify({"status": "ok", "total": data["total"]})
-
-
-@app.route("/food/diary/delete", methods=["POST"])
-def food_diary_delete():
-    """Remove one entry by index."""
-    body = request.get_json(force=True) or {}
-    idx = body.get("index")
-    if idx is None:
-        return jsonify({"error": "index required"}), 400
-    today = datetime.date.today().isoformat()
-    if not os.path.exists(FS_DIARY_FILE):
-        return jsonify({"error": "no diary"}), 404
-    with open(FS_DIARY_FILE, encoding="utf-8") as f:
-        data = json.load(f)
-    if data.get("date") != today:
-        return jsonify({"error": "diary date mismatch"}), 400
-    entries = data.get("entries", [])
-    if 0 <= idx < len(entries):
-        entries.pop(idx)
-    # Recalculate
+def _recalc_diary_totals(entries):
     fat = carbs = protein = calories = 0.0
     for e in entries:
         factor = e.get("grams", 100) / 100.0
@@ -805,15 +855,100 @@ def food_diary_delete():
         protein  += (p.get("protein",  0) or 0) * factor
         fat      += (p.get("fat",      0) or 0) * factor
         carbs    += (p.get("carbs",    0) or 0) * factor
-    data["total"] = {
-        "calories": round(calories, 1),
-        "protein":  round(protein,  1),
-        "fat":      round(fat,      1),
-        "carbs":    round(carbs,    1),
-    }
+    return {"calories": round(calories,1), "protein": round(protein,1),
+            "fat": round(fat,1), "carbs": round(carbs,1)}
+
+def _load_all_diary():
+    """Load multi-day diary dict {date_str: {entries, total}}. Auto-migrates old format."""
+    if not os.path.exists(FOOD_DIARY_FILE):
+        return {}
+    with open(FOOD_DIARY_FILE, encoding="utf-8") as f:
+        data = json.load(f)
+    # Migrate old single-day format {"date":..., "entries":...}
+    if isinstance(data, dict) and "entries" in data and "date" in data:
+        key = data["date"]
+        migrated = {key: {"entries": data.get("entries",[]), "total": data.get("total")}}
+        with open(FOOD_DIARY_FILE, "w", encoding="utf-8") as f:
+            json.dump(migrated, f, ensure_ascii=False, indent=2)
+        return migrated
+    return data
+
+def _load_diary(date_str=None):
+    date_str = date_str or datetime.date.today().isoformat()
+    all_data = _load_all_diary()
+    day = all_data.get(date_str, {})
+    return {"date": date_str, "entries": day.get("entries",[]), "total": day.get("total")}
+
+def _save_diary(data):
+    date_str = data.get("date", datetime.date.today().isoformat())
+    all_data = _load_all_diary()
+    all_data[date_str] = {"entries": data.get("entries",[]), "total": data.get("total"),
+                          "updated_at": data.get("updated_at","")}
+    with open(FOOD_DIARY_FILE, "w", encoding="utf-8") as f:
+        json.dump(all_data, f, ensure_ascii=False, indent=2)
+
+
+@app.route("/food/diary", methods=["GET", "POST"])
+def food_diary_api():
+    if request.method == "GET":
+        date = request.args.get("date", datetime.date.today().isoformat())
+        return jsonify(_load_diary(date))
+    entry = request.get_json(force=True)
+    if not entry:
+        return jsonify({"error": "no body"}), 400
+    data = _load_diary()
+    data["entries"].append(entry)
+    data["total"] = _recalc_diary_totals(data["entries"])
+    data["updated_at"] = datetime.datetime.now().isoformat()
+    _save_diary(data)
+    return jsonify({"status": "ok", "total": data["total"]})
+
+
+@app.route("/food/diary/today")
+def food_diary_today():
+    """Return today's nutrition totals — for n8n evening report."""
+    data = _load_diary()
+    total = data.get("total") or {"calories":0,"protein":0,"fat":0,"carbs":0}
+    entries = data.get("entries", [])
+    return jsonify({"date": data["date"], "calories": total.get("calories",0),
+                    "protein": total.get("protein",0), "fat": total.get("fat",0),
+                    "carbs": total.get("carbs",0), "entries": len(entries),
+                    "logged": len(entries) > 0})
+
+
+@app.route("/food/diary/stats")
+def food_diary_stats():
+    """Return calorie/macro history for last N days (default 7) — for stats chart."""
+    days = int(request.args.get("days", 7))
+    all_data = _load_all_diary()
+    result = []
+    for i in range(days - 1, -1, -1):
+        d = (datetime.date.today() - datetime.timedelta(days=i)).isoformat()
+        day = all_data.get(d, {})
+        total = day.get("total") or {}
+        result.append({"date": d, "calories": total.get("calories",0),
+                        "protein": total.get("protein",0), "fat": total.get("fat",0),
+                        "carbs": total.get("carbs",0)})
+    logged = [r for r in result if r["calories"] > 0]
+    avg = {k: round(sum(r[k] for r in logged)/len(logged), 1) if logged else 0
+           for k in ["calories","protein","fat","carbs"]}
+    return jsonify({"days": result, "avg": avg, "logged_days": len(logged)})
+
+
+@app.route("/food/diary/delete", methods=["POST"])
+def food_diary_delete():
+    body = request.get_json(force=True) or {}
+    idx  = body.get("index")
+    date = body.get("date", datetime.date.today().isoformat())
+    if idx is None:
+        return jsonify({"error": "index required"}), 400
+    data = _load_diary(date)
+    entries = data.get("entries", [])
+    if 0 <= idx < len(entries):
+        entries.pop(idx)
     data["entries"] = entries
-    with open(FS_DIARY_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    data["total"] = _recalc_diary_totals(entries)
+    _save_diary(data)
     return jsonify({"status": "ok", "total": data["total"]})
 
 

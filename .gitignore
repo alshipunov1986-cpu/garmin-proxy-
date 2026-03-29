@@ -12,3 +12,5 @@ garmin-browser-auth.py
 extract_tokens_after_login.py
 launch_chrome_debug.bat
 login.sh
+fatsecret_tokens.txt
+.env
