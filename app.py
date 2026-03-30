@@ -1103,7 +1103,7 @@ def _collect_day_data(date_str):
     try:
         spo2 = garmin_call(lambda g: g.get_spo2_data(date_str))
         if isinstance(spo2, dict):
-            d["spo2"] = spo2.get("averageSpo2") or spo2.get("latestSpo2")
+            d["spo2"] = spo2.get("averageSpO2") or spo2.get("latestSpO2") or spo2.get("lastSevenDaysAvgSpO2")
         else:
             d["spo2"] = None
     except Exception:
