@@ -259,7 +259,7 @@ def all_today():
         hs = hrv.get("hrvSummary", {}) if isinstance(hrv, dict) else {}
         result["hrv"] = {
             "weekly_avg": hs.get("weeklyAvg"),
-            "last_night_avg": hs.get("lastNight"),
+            "last_night_avg": hs.get("lastNightAvg"),
             "last_night_5_min_high": hs.get("lastNight5MinHigh"),
             "status": hs.get("status"),
         }
@@ -1060,7 +1060,7 @@ def _collect_day_data(date_str):
     try:
         hrv = garmin_call(lambda g: g.get_hrv_data(date_str))
         hs = hrv.get("hrvSummary", {}) if isinstance(hrv, dict) else {}
-        d["hrv"]          = hs.get("lastNight")
+        d["hrv"]          = hs.get("lastNightAvg")
         d["hrv_weekly"]   = hs.get("weeklyAvg")
     except Exception:
         d.update({"hrv": None, "hrv_weekly": None})
