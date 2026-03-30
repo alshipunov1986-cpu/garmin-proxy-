@@ -15,3 +15,12 @@ login.sh
 fatsecret_tokens.txt
 .env
 .env.anthropic_key
+GARMIN_TOKENS_FIXED.txt
+GARMIN_TOKENS_NEW.txt
+fatsecret_diary.json
+food_diary.json
+food_cards.json
+fatsecret_token.json
+fatsecret_oauth_state.json
+*.log
+proxy*.log
