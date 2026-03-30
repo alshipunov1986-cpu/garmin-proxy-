@@ -5,9 +5,17 @@ $python = "$proxyDir\.venv\Scripts\python.exe"
 
 Write-Host "=== Installing NSSM Services ===" -ForegroundColor Green
 
-# Read tokens
+# Read secrets from files (never committed — see .env.example)
 $garminTokens = Get-Content "$proxyDir\GARMIN_TOKENS.txt" -Raw
 $anthropicKey = Get-Content "$proxyDir\.env.anthropic_key" -Raw
+
+# Read .env file for other secrets
+$envFile = Get-Content "$proxyDir\.env" | Where-Object { $_ -match "=" }
+$envHash = @{}
+foreach ($line in $envFile) {
+    $parts = $line -split "=", 2
+    $envHash[$parts[0].Trim()] = $parts[1].Trim()
+}
 
 # Remove existing service if present
 try { & $nssm stop GarminProxy 2>$null } catch {}
@@ -28,20 +36,18 @@ Write-Host "[1/2] Installing GarminProxy..." -ForegroundColor Yellow
 & $nssm set GarminProxy AppRotateFiles 1
 & $nssm set GarminProxy AppRotateBytes 1048576
 
-# Set environment - each var on separate line
+# Set environment — loaded from .env and token files
 $envVars = @(
     "GARMIN_TOKENS=$($garminTokens.Trim())",
-    "API_KEY=myhealthkey2026",
+    "API_KEY=$($envHash['API_KEY'])",
     "PORT=5001",
-    "FATSECRET_CLIENT_ID=fddbfa79a1a94a1d929a5df4b09a2b12",
-    "FATSECRET_CLIENT_SECRET=76f131b4e1664a0d8db59742072841a2",
-    "FATSECRET_USER=al.shipunov1986@gmail.com",
-    "FATSECRET_PASS=Al0634400474!",
+    "FATSECRET_CLIENT_ID=$($envHash['FATSECRET_CLIENT_ID'])",
+    "FATSECRET_CLIENT_SECRET=$($envHash['FATSECRET_CLIENT_SECRET'])",
+    "FATSECRET_USER=$($envHash['FATSECRET_USER'])",
+    "FATSECRET_PASS=$($envHash['FATSECRET_PASS'])",
     "ANTHROPIC_API_KEY=$($anthropicKey.Trim())"
 )
 
-# NSSM expects multi-string as null-separated
-$envString = $envVars -join "`0"
 & $nssm set GarminProxy AppEnvironmentExtra $envVars
 
 & $nssm start GarminProxy

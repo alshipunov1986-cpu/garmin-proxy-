@@ -4,8 +4,10 @@ echo.
 
 REM Load tokens from file
 set /p GARMIN_TOKENS=<"%~dp0GARMIN_TOKENS.txt"
-set API_KEY=myhealthkey2026
 set PORT=5000
+
+REM Load secrets from .env file (never committed — see .env.example)
+for /f "usebackq tokens=1,* delims==" %%A in ("%~dp0.env") do set %%A=%%B
 
 echo Starting Flask proxy on port %PORT%...
 echo Tokens loaded: %GARMIN_TOKENS:~0,20%...
