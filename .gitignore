@@ -14,3 +14,4 @@ launch_chrome_debug.bat
 login.sh
 fatsecret_tokens.txt
 .env
+.env.anthropic_key

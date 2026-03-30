@@ -286,32 +286,22 @@ def all_today():
     except Exception as e:
         result["daily_stats"] = {"error": str(e)}
 
-    # Body battery (yesterday to today)
+    # Body battery
     try:
-        bb = garmin_call(lambda g: g.get_body_battery(date_yesterday, date_today))
-        if isinstance(bb, list) and len(bb) > 0:
-            charged = sum(d.get("charged", 0) for d in bb if isinstance(d, dict))
-            drained = sum(d.get("drained", 0) for d in bb if isinstance(d, dict))
-            # Current level: last reading from today's stat list
-            current_level = None
-            for d in bb:
-                if isinstance(d, dict) and d.get("date") == date_today:
-                    stats = d.get("bodyBatteryStatList") or []
-                    if stats:
-                        current_level = stats[-1].get("bodyBatteryLevel")
-            wake_level = result.get("daily_stats", {}).get("body_battery_wake")
-            # "израсходовано" = wake_level - current_level (positive = used, negative = gained)
-            net_used = None
-            if wake_level is not None and current_level is not None:
-                net_used = wake_level - current_level
-            result["body_battery"] = {
-                "charged": charged,
-                "drained": drained,
-                "current_level": current_level,
-                "net_used_since_wake": net_used,  # >0 used, <0 recovered
-            }
-        else:
-            result["body_battery"] = bb
+        # Get current level from daily stats (most reliable source)
+        today_stats = garmin_call(lambda g: g.get_stats(date_today))
+        current_level = today_stats.get("bodyBatteryMostRecentValue") if isinstance(today_stats, dict) else None
+        wake_level = result.get("daily_stats", {}).get("body_battery_wake")
+        # net_used = wake - current (0 if gained)
+        net_used = None
+        if wake_level is not None and current_level is not None:
+            net_used = max(0, wake_level - current_level)
+        result["body_battery"] = {
+            "current_level": current_level,
+            "net_used_since_wake": net_used,  # >0 used, 0 if recovered
+            "highest": today_stats.get("bodyBatteryHighestValue") if isinstance(today_stats, dict) else None,
+            "lowest": today_stats.get("bodyBatteryLowestValue") if isinstance(today_stats, dict) else None,
+        }
     except Exception as e:
         result["body_battery"] = {"error": str(e)}
 
@@ -619,25 +609,41 @@ _FS_BROWSER    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
 def _fs_parse_diary(html):
     """Parse FatSecret diary HTML → nutrition dict."""
     import re
-    text = re.sub(r'<[^>]+>', ' ', html)   # strip tags
-    text = re.sub(r'[ \t]+', ' ', text)
 
-    total = None
-    m = re.search(r'([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s', text)
-    if m:
-        total = {"fat": float(m[1]), "carbs": float(m[2]),
-                 "protein": float(m[3]), "calories": int(m[4])}
+    def _extract_meal(html, meal_name):
+        """Extract fat/carbs/protein/calories from title attributes."""
+        fat_m = re.search(rf'Total {meal_name} Fat:\s*([\d.]+)', html)
+        carbs_m = re.search(rf'Total {meal_name} Carbohy\w*:\s*([\d.]+)', html)
+        prot_m = re.search(rf'Total {meal_name} Protein:\s*([\d.]+)', html)
+        cal_m = re.search(rf'Total {meal_name} Calories:\s*(\d+)', html)
+        if cal_m and int(cal_m.group(1)) > 0:
+            return {
+                "fat": float(fat_m.group(1)) if fat_m else 0,
+                "carbs": float(carbs_m.group(1)) if carbs_m else 0,
+                "protein": float(prot_m.group(1)) if prot_m else 0,
+                "calories": int(cal_m.group(1)),
+            }
+        return None
 
     meals = {}
-    for meal_m in re.finditer(
-            r'(Breakfast|Lunch|Dinner|Snacks/Other)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)',
-            text):
-        meals[meal_m[1].lower()] = {
-            "fat": float(meal_m[2]), "carbs": float(meal_m[3]),
-            "protein": float(meal_m[4]), "calories": int(meal_m[5])
+    for meal in ["Breakfast", "Lunch", "Dinner", "Snacks/Other"]:
+        data = _extract_meal(html, meal)
+        if data:
+            meals[meal.lower()] = data
+
+    # Total: sum of meals or parse from page
+    total = None
+    if meals:
+        total = {
+            "fat": round(sum(m["fat"] for m in meals.values()), 2),
+            "carbs": round(sum(m["carbs"] for m in meals.values()), 2),
+            "protein": round(sum(m["protein"] for m in meals.values()), 2),
+            "calories": sum(m["calories"] for m in meals.values()),
         }
 
-    date_m = re.search(r'Today,\s+\w+\s+(\d+\s+\w+\s+\d{4})', text)
+    # Date from page
+    text = re.sub(r'<[^>]+>', ' ', html)
+    date_m = re.search(r'(?:Today|Yesterday),\s+\w+\s+(\d+\s+\w+\s+\d{4})', text)
     return {
         "date": date_m.group(1) if date_m else str(datetime.date.today()),
         "total": total,
@@ -645,8 +651,10 @@ def _fs_parse_diary(html):
     }
 
 
-def _fs_scrape():
-    """Login to FatSecret and scrape today's diary. Returns parsed dict."""
+def _fs_scrape(date_str=None):
+    """Login to FatSecret and scrape diary. Returns parsed dict.
+    date_str: optional YYYY-MM-DD (default: today).
+    """
     if not FATSECRET_USER or not FATSECRET_PASS:
         raise RuntimeError("FATSECRET_USER / FATSECRET_PASS env vars not set")
 
@@ -677,10 +685,19 @@ def _fs_scrape():
     if "Sign out" not in login_resp.text and "sign out" not in login_resp.text.lower():
         raise RuntimeError("FatSecret login failed — check credentials")
 
-    # Step 3: GET diary
-    diary_resp = session.get(FS_DIARY_URL, timeout=15)
+    # Step 3: GET diary (with optional date)
+    url = FS_DIARY_URL
+    if date_str:
+        target = datetime.date.fromisoformat(date_str)
+        epoch = datetime.date(1970, 1, 1)
+        dd = (target - epoch).days
+        url += f"&dd={dd}&dt={dd}"
+    diary_resp = session.get(url, timeout=15)
     diary_resp.raise_for_status()
-    return _fs_parse_diary(diary_resp.text)
+    result = _fs_parse_diary(diary_resp.text)
+    if date_str:
+        result["date"] = date_str
+    return result
 
 
 @app.route("/fatsecret/update", methods=["POST"])
@@ -711,9 +728,10 @@ def fatsecret_update_form():
 @app.route("/fatsecret/sync")
 @require_api_key
 def fatsecret_sync():
-    """Login to FatSecret, scrape today's diary, save and return."""
+    """Login to FatSecret, scrape diary, save and return. ?date=YYYY-MM-DD optional."""
     try:
-        data = _fs_scrape()
+        date_param = request.args.get("date")
+        data = _fs_scrape(date_param)
         data["updated_at"] = datetime.date.today().isoformat()
         with open(FS_DIARY_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
@@ -980,6 +998,7 @@ SHEET_HEADERS = [
     "Body Battery утром", "Body Battery вечером", "Израсходовано BB",
     "Стресс средний", "Стресс пик", "Шаги", "Активные калории",
     "Температура кожи", "Тренировки", "SpO2",
+    "Калории (еда)", "Белки (г)", "Жиры (г)", "Углеводы (г)",
 ]
 
 _sheet_ws = None
@@ -1009,11 +1028,11 @@ def get_sheet():
             ws.update_title(SHEET_NAME)
         except Exception:
             ws = sh.add_worksheet(title=SHEET_NAME, rows=2000, cols=25)
-    # Ensure headers row exists
+    # Ensure headers row is correct and complete
     first_row = ws.row_values(1)
-    if not first_row or first_row[0] != SHEET_HEADERS[0]:
+    if first_row != SHEET_HEADERS:
         ws.update(range_name="A1", values=[SHEET_HEADERS])
-        ws.format("A1:S1", {"textFormat": {"bold": True}})
+        ws.format("A1:W1", {"textFormat": {"bold": True}})
     _sheet_ws = ws
     return ws
 
@@ -1058,20 +1077,13 @@ def _collect_day_data(date_str):
         d.update({"resting_hr": None, "resting_hr_7d": None, "bb_wake": None,
                   "avg_stress": None, "max_stress": None, "steps": None, "active_calories": None})
 
-    # Body battery — current level + net used since wake
+    # Body battery — current level from stats (bodyBatteryMostRecentValue)
     try:
-        prev = (datetime.date.fromisoformat(date_str) - datetime.timedelta(days=1)).isoformat()
-        bb = garmin_call(lambda g: g.get_body_battery(prev, date_str))
-        current_level = None
-        if isinstance(bb, list):
-            for item in bb:
-                if isinstance(item, dict) and item.get("date") == date_str:
-                    sl = item.get("bodyBatteryStatList") or []
-                    if sl:
-                        current_level = sl[-1].get("bodyBatteryLevel")
-        d["bb_current"]  = current_level
+        # stats already fetched above, reuse it
+        d["bb_current"] = stats.get("bodyBatteryMostRecentValue") if isinstance(stats, dict) else None
         bb_wake = d.get("bb_wake")
-        d["bb_net_used"] = (bb_wake - current_level) if (bb_wake is not None and current_level is not None) else None
+        bb_cur = d.get("bb_current")
+        d["bb_net_used"] = max(0, bb_wake - bb_cur) if (bb_wake is not None and bb_cur is not None) else None
     except Exception:
         d.update({"bb_current": None, "bb_net_used": None})
 
@@ -1094,6 +1106,20 @@ def _collect_day_data(date_str):
             d["spo2"] = None
     except Exception:
         d["spo2"] = None
+
+    # Nutrition (FatSecret scraper)
+    try:
+        if FATSECRET_USER and FATSECRET_PASS:
+            fs = _fs_scrape(date_str)
+            total = fs.get("total") or {}
+            d["food_calories"] = total.get("calories")
+            d["food_protein"]  = total.get("protein")
+            d["food_fat"]      = total.get("fat")
+            d["food_carbs"]    = total.get("carbs")
+        else:
+            d.update({"food_calories": None, "food_protein": None, "food_fat": None, "food_carbs": None})
+    except Exception:
+        d.update({"food_calories": None, "food_protein": None, "food_fat": None, "food_carbs": None})
 
     return d
 
@@ -1120,6 +1146,10 @@ def _day_data_to_row(date_str, d):
         d.get("skin_temp"),
         d.get("workouts"),
         d.get("spo2"),
+        d.get("food_calories"),
+        d.get("food_protein"),
+        d.get("food_fat"),
+        d.get("food_carbs"),
     ]
 
 
@@ -1167,7 +1197,7 @@ def sheets_history():
     days = int(request.args.get("days", 30))
     try:
         ws = get_sheet()
-        all_rows = ws.get_all_records()
+        all_rows = ws.get_all_records(expected_headers=SHEET_HEADERS)
         cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
         filtered = [r for r in all_rows if str(r.get("Дата", "")) >= cutoff]
         return jsonify({"days": days, "count": len(filtered), "data": filtered})
