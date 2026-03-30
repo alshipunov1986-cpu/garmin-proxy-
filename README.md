@@ -1,73 +1,117 @@
 # garmin-proxy
 
-Flask-сервер для получения данных из Garmin Connect. Деплоится на Render.com.
+Flask-прокси для получения данных из Garmin Connect + FatSecret. Работает локально на ноутбуке, доступен через Tailscale Funnel. Резервный деплой на Render.com.
+
+> Подробная техническая документация: **[SYSTEM_OVERVIEW.md](SYSTEM_OVERVIEW.md)**
+
+---
+
+## Архитектура
+
+```
+Garmin Connect API
+      ↓
+Flask-прокси (localhost:5001)
+      ↓
+Tailscale Funnel (https://lenovo-15.tail1309d4.ts.net)
+      ↓
+n8n Cloud → Claude AI → Telegram
+      ↓
+Google Sheets (история 30+ дней)
+```
+
+---
 
 ## Эндпоинты
 
 | Метод | Путь | Описание |
 |-------|------|----------|
-| GET | `/sleep` | Сон за вчера |
-| GET | `/hrv` | HRV за вчера |
-| GET | `/body-battery` | Body Battery за вчера и сегодня |
-| GET | `/activities` | Активности за 7 дней |
-| GET | `/weekly-stats` | Шаги, калории, стресс за 7 дней |
+| GET | `/` | Список всех эндпоинтов |
+| GET | `/all-today` | **Главный**: сон, HRV, Body Battery, стресс, активности, питание |
+| GET | `/sleep` | Сон за вчера/дату |
+| GET | `/hrv` | HRV данные |
+| GET | `/body-battery` | Body Battery |
+| GET | `/activities` | Тренировки за 7 дней |
+| GET | `/stats` | Дневная статистика |
+| GET | `/steps` | Шаги |
+| GET | `/stress` | Стресс |
+| GET | `/respiration` | Дыхание |
+| GET | `/spo2` | SpO2 |
+| GET | `/heart-rate` | Пульс за день |
+| GET | `/weekly-stats` | Статистика за 7 дней |
+| GET/POST | `/sheets/save-day` | Сохранить день в Google Sheets |
+| GET | `/sheets/history` | История из Google Sheets `?days=30` |
+| GET | `/fatsecret/sync` | Скрапинг дневника FatSecret |
+| GET | `/fatsecret/diary` | Данные питания из файла |
+| GET | `/food` | Food PWA (мобильный дневник питания) |
+| GET | `/debug-token` | Диагностика Garmin токена |
 
-Все эндпоинты требуют заголовок `X-API-Key: <ваш ключ>`.
+Все эндпоинты (кроме `/food/*` и `/fatsecret/update`) требуют заголовок:
+```
+X-API-Key: myhealthkey2026
+```
 
 ---
 
-## Настройка (обязательные шаги)
+## Локальный запуск
 
-### Шаг 1 — Получи токены локально
-
-Garmin блокирует авторизацию по логину/паролю с облачных серверов.
-Поэтому нужно один раз войти локально и сохранить OAuth-токены.
-
-**Установи зависимости локально:**
-```bash
-pip install garminconnect
+```bat
+start-local.bat
 ```
 
-**Запусти скрипт** (Git Bash / macOS / Linux):
-```bash
-GARMIN_EMAIL=your@email.com GARMIN_PASSWORD=yourpassword python get_tokens.py
-```
-
-**Windows PowerShell:**
+Или через NSSM-сервис (автоматически при старте Windows):
 ```powershell
-$env:GARMIN_EMAIL="your@email.com"
-$env:GARMIN_PASSWORD="yourpassword"
+Get-Service GarminProxy, TailscaleFunnel
+Start-Service GarminProxy
+```
+
+---
+
+## Автозапуск (NSSM — Windows Service)
+
+С 2026-03-30 прокси и Tailscale Funnel работают как Windows-сервисы:
+
+| Сервис | Действие | Auto-restart |
+|--------|---------|-------------|
+| `GarminProxy` | Flask на порту 5001 | ✅ через 5 сек |
+| `TailscaleFunnel` | `tailscale funnel 5001` | ✅ через 5 сек |
+
+Установка: запустить `install_services.ps1` от администратора.
+
+---
+
+## Обновление токенов Garmin
+
+Если `/all-today` возвращает 401:
+```bash
 python get_tokens.py
 ```
-
-Скрипт выведет содержимое токенов и сохранит их в `tokens.json`.
+Скрипт сохранит токены в `GARMIN_TOKENS.txt`. Скопировать также в переменную `GARMIN_TOKENS` на Render.
 
 ---
 
-### Шаг 2 — Добавь переменные окружения на Render
+## Переменные окружения
 
-В разделе **Environment Variables** добавь:
-
-| Переменная | Значение |
+| Переменная | Описание |
 |------------|----------|
-| `GARMIN_TOKENS` | Вставь содержимое файла `tokens.json` (всю строку целиком) |
-| `API_KEY` | Любая секретная строка, например `myhealthkey2026` |
+| `GARMIN_TOKENS` | OAuth2 токены Garmin (из `GARMIN_TOKENS.txt`) |
+| `API_KEY` | Ключ защиты эндпоинтов (`myhealthkey2026`) |
+| `GOOGLE_CREDENTIALS` | JSON сервис-аккаунта для Google Sheets |
+| `FATSECRET_CLIENT_ID` | OAuth client_id FatSecret |
+| `FATSECRET_CLIENT_SECRET` | OAuth client_secret FatSecret |
+| `FATSECRET_USER` | Email аккаунта FatSecret (для scraping) |
+| `FATSECRET_PASS` | Пароль FatSecret (для scraping) |
 
-> `GARMIN_EMAIL` и `GARMIN_PASSWORD` на Render **не нужны**.
-
----
-
-### Шаг 3 — Задеплой и проверь
-
-После деплоя проверь через браузер или Postman:
-```
-GET https://garmin-proxy-xxxx.onrender.com/sleep
-Headers: X-API-Key: myhealthkey2026
-```
+Локально переменные читаются из `.env` файла (не в git).
 
 ---
 
-## Обновление токенов
+## n8n Воркфлоу
 
-Токены Garmin живут долго, но если получишь ошибку 401 от Garmin — просто
-запусти `get_tokens.py` снова локально и обнови `GARMIN_TOKENS` на Render.
+| Воркфлоу | Триггер | Описание |
+|----------|---------|----------|
+| Morning Report | 08:30 | Утренний отчёт: сон, HRV, Body Battery, рекомендация |
+| Evening Report | 23:01 | Вечерний итог дня + тренды |
+| Hourly Monitor | Каждый час | Мониторинг в течение дня |
+
+Все HTTP-ноды настроены с **retry: 3 попытки, пауза 5 сек** (решает нестабильность Tailscale Funnel).

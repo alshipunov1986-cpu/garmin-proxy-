@@ -249,11 +249,45 @@ Send to Telegram
 
 ---
 
-### Воркфлоу 3: Auto Save to Sheets (если настроен)
+### Воркфлоу 3: Hourly Monitor (ID: `cKjo6HKAaLeNDNLB`)
+
+**Триггер**: каждый час
+
+```
+Hourly Trigger
+    ↓
+Fetch Health Data (retry: 3x, пауза 5 сек)
+    HTTP GET https://lenovo-15.tail1309d4.ts.net/all-today
+    Header: X-API-Key: ***
+    ↓
+Health Analysis Agent (Claude)
+    ↓
+Send to Telegram (если есть что сообщить)
+```
+
+**Назначение**: мониторинг в течение дня, алерты при аномалиях.
+
+---
+
+### Воркфлоу 4: Auto Save to Sheets (если настроен)
 
 > Ещё не создан как отдельный воркфлоу. Пока `/sheets/save-day` вызывается вручную через `load_history.py`.
 
 **Рекомендуется добавить**: триггер в 23:45 → HTTP POST `/sheets/save-day` (без параметра, сохранит вчера).
+
+---
+
+### Retry-настройка HTTP-нод (добавлено 2026-03-30)
+
+Все HTTP-ноды во всех воркфлоу настроены с retry:
+
+| Воркфлоу | Ноды с retry | Попыток | Пауза |
+|----------|-------------|---------|-------|
+| Morning Report | Fetch All Health Data, Fetch History | 3 | 5 сек |
+| Evening Report | Sync FatSecret, Fetch Health Data, Fetch History | 3 | 5 сек |
+| Hourly Monitor | Fetch Health Data | 3 | 5 сек |
+
+Причина: Tailscale Funnel иногда даёт `connection reset` для внешних серверов n8n Cloud — retry решает проблему нестабильности без дополнительной инфраструктуры.
 
 ---
 
@@ -325,13 +359,30 @@ Send to Telegram
 | `food_cards.json` | Личные карточки продуктов — файл локальный |
 | Food PWA `/food/*` | Работает только на локальном прокси |
 
-### Автозагрузка (Windows Startup)
+### Автозагрузка (Windows Services — NSSM)
 
-При включении ноутбука автоматически запускаются:
-1. **`GarminProxy.vbs`** — Flask-прокси на порту 5001 (скрытое окно)
-2. **`TailscaleFunnel.vbs`** — `tailscale funnel 5001` с задержкой 15 сек (скрытое окно)
+С 2026-03-30 прокси и Tailscale Funnel работают как **Windows-сервисы через NSSM** (Non-Sucking Service Manager). VBS-скрипты из Startup удалены.
 
-Файлы в: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\`
+| Сервис | Имя в NSSM | Что делает | Auto-restart |
+|--------|-----------|-----------|-------------|
+| `GarminProxy` | `GarminProxy` | Flask-прокси на порту 5001 | ✅ через 5 сек |
+| `TailscaleFunnel` | `TailscaleFunnel` | `tailscale funnel 5001` | ✅ через 5 сек |
+
+**Управление сервисами** (PowerShell от администратора):
+```powershell
+# Статус
+Get-Service GarminProxy, TailscaleFunnel
+
+# Перезапуск
+Restart-Service GarminProxy
+
+# Логи NSSM
+nssm status GarminProxy
+```
+
+**Установочный скрипт**: `install_services.ps1` / `install_services2.ps1`
+
+**Проверка после kill-теста**: `Stop-Process -Name python -Force` → через 5 сек `Get-Service GarminProxy` показывает `Running` ✅
 
 ### Что произойдёт при смене Wi-Fi или IP
 
@@ -342,7 +393,8 @@ Send to Telegram
 
 ### Что произойдёт при перезагрузке компьютера
 
-- Flask + Tailscale Funnel **запускаются автоматически** через Startup-скрипты ✅
+- Flask + Tailscale Funnel **запускаются автоматически** как Windows-сервисы (NSSM, `SERVICE_AUTO_START`) ✅
+- Если прокси упадёт — NSSM перезапустит через 5 сек ✅
 - Tailscale сервис стартует автоматически (Windows service) ✅
 - Render продолжает работать независимо (но Garmin API с него не работает)
 
@@ -422,12 +474,17 @@ Send to Telegram
 ```
 1. Открыть https://alj.app.n8n.cloud → проверить последние выполнения
 2. Если ошибка в ноде "Fetch Health Data" или "Fetch History":
-   → проверить что ноутбук включён и прокси работает:
+   → проверить что ноутбук включён и NSSM-сервис работает:
+     Get-Service GarminProxy, TailscaleFunnel   (PowerShell)
+   → если сервис Stopped — перезапустить:
+     Start-Service GarminProxy
+     Start-Service TailscaleFunnel
+   → проверить прокси напрямую:
      curl https://lenovo-15.tail1309d4.ts.net/ -H "X-API-Key: myhealthkey2026"
-   → если не отвечает — запустить прокси:
-     cd "D:\Проэкты Клод\garmin-proxy" && start-local.bat
-   → запустить Tailscale Funnel:
-     tailscale funnel 5001
+   → если прокси работает, но n8n не достучивается — это нестабильность Tailscale Funnel.
+     retry (3 попытки по 5 сек) должен решить автоматически.
+     Можно принудительно перезапустить Funnel:
+     Restart-Service TailscaleFunnel
 3. Если ошибка в Claude агенте:
    → проверить API ключ Anthropic в n8n Credentials
 4. Если ошибка в Telegram:
