@@ -1202,6 +1202,23 @@ def sheets_history():
         all_rows = ws.get_all_records(expected_headers=SHEET_HEADERS)
         cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
         filtered = [r for r in all_rows if str(r.get("Дата", "")) >= cutoff]
+        # Convert raw Garmin units → human units before returning to n8n
+        # "Сон (ч)" is stored in minutes → convert to hours
+        # "Белки/Жиры/Углеводы (г)" are stored in mg → convert to grams
+        for row in filtered:
+            v = row.get("Сон (ч)")
+            if v not in (None, "", 0):
+                try:
+                    row["Сон (ч)"] = round(float(v) / 60, 2)
+                except (ValueError, TypeError):
+                    pass
+            for col in ("Белки (г)", "Жиры (г)", "Углеводы (г)"):
+                v = row.get(col)
+                if v not in (None, "", 0):
+                    try:
+                        row[col] = round(float(v) / 1000, 1)
+                    except (ValueError, TypeError):
+                        pass
         return jsonify({"days": days, "count": len(filtered), "data": filtered})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
