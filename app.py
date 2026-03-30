@@ -732,6 +732,8 @@ def fatsecret_sync():
     try:
         date_param = request.args.get("date")
         data = _fs_scrape(date_param)
+        # Normalize date to ISO format (YYYY-MM-DD)
+        data["date"] = date_param or datetime.date.today().isoformat()
         data["updated_at"] = datetime.date.today().isoformat()
         with open(FS_DIARY_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
