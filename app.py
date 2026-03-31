@@ -896,6 +896,145 @@ def fatsecret_diary():
     return jsonify(data)
 
 
+FOOD_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "food_history.json")
+
+
+def _fs_scrape_month(year, month):
+    """Login once, scrape every day of the month. Returns {date_str: {...}}."""
+    import calendar
+    if not FATSECRET_USER or not FATSECRET_PASS:
+        raise RuntimeError("FATSECRET_USER / FATSECRET_PASS not set")
+
+    session = requests.Session()
+    session.headers["User-Agent"] = _FS_BROWSER
+
+    # One-time login
+    login_page = session.get(FS_LOGIN_URL, timeout=15)
+    login_page.raise_for_status()
+    vs_m  = re.search(r'id="__VIEWSTATE"\s+value="([^"]+)"', login_page.text)
+    vsg_m = re.search(r'id="__VIEWSTATEGENERATOR"\s+value="([^"]+)"', login_page.text)
+    ev_m  = re.search(r'id="__EVENTVALIDATION"\s+value="([^"]+)"', login_page.text)
+    login_data = {
+        "__EVENTTARGET": "", "__EVENTARGUMENT": "",
+        "__VIEWSTATE": vs_m.group(1) if vs_m else "",
+        "__VIEWSTATEGENERATOR": vsg_m.group(1) if vsg_m else "",
+        "__EVENTVALIDATION": ev_m.group(1) if ev_m else "",
+        "ctl00$ctl11$Logincontrol1$Name": FATSECRET_USER,
+        "ctl00$ctl11$Logincontrol1$Password": FATSECRET_PASS,
+        "ctl00$ctl11$Logincontrol1$Login": "Log In",
+    }
+    login_resp = session.post(FS_LOGIN_URL, data=login_data, timeout=15, allow_redirects=True)
+    if "Sign out" not in login_resp.text and "sign out" not in login_resp.text.lower():
+        raise RuntimeError("FatSecret login failed — check credentials")
+
+    epoch = datetime.date(1970, 1, 1)
+    _, days_in_month = calendar.monthrange(year, month)
+    today = datetime.date.today()
+    results = {}
+
+    for day in range(1, days_in_month + 1):
+        d = datetime.date(year, month, day)
+        if d > today:
+            break
+        date_str = d.isoformat()
+        dd = (d - epoch).days
+        url = FS_DIARY_URL + f"&dd={dd}&dt={dd}"
+        try:
+            resp = session.get(url, timeout=15)
+            resp.raise_for_status()
+            parsed = _fs_parse_diary_items(resp.text)
+            parsed["date"] = date_str
+            all_items = [i for m in parsed["meals"].values() for i in m]
+            if all_items:
+                results[date_str] = parsed
+                app.logger.info("Scraped %s: %d items", date_str, len(all_items))
+            else:
+                app.logger.info("Scraped %s: empty (no items logged)", date_str)
+        except Exception as e:
+            app.logger.warning("Failed to scrape %s: %s", date_str, e)
+
+    return results
+
+
+@app.route("/fatsecret/sync-month")
+@require_api_key
+def fatsecret_sync_month():
+    """Scrape all food diary entries for a month → save to food_history.json.
+    ?year=2026&month=3  (default: current month)
+    """
+    try:
+        year  = int(request.args.get("year",  datetime.date.today().year))
+        month = int(request.args.get("month", datetime.date.today().month))
+    except ValueError:
+        return jsonify({"error": "Invalid year/month params"}), 400
+
+    try:
+        month_data = _fs_scrape_month(year, month)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # Load existing history and merge (keeps other months intact)
+    history = {}
+    if os.path.exists(FOOD_HISTORY_FILE):
+        with open(FOOD_HISTORY_FILE, encoding="utf-8") as f:
+            history = json.load(f)
+
+    history.update(month_data)
+    history = dict(sorted(history.items()))  # sort by date
+
+    with open(FOOD_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+    total_items = sum(
+        len([i for m in d["meals"].values() for i in m])
+        for d in month_data.values()
+    )
+    return jsonify({
+        "status": "ok",
+        "month": f"{year}-{month:02d}",
+        "days_with_data": len(month_data),
+        "total_food_entries": total_items,
+        "saved_to": "food_history.json",
+    })
+
+
+@app.route("/fatsecret/history")
+@require_api_key
+def fatsecret_history():
+    """Read food history from food_history.json.
+    ?date=YYYY-MM-DD  → one day
+    ?month=YYYY-MM    → all days in that month
+    (no params)       → full history, summary only
+    """
+    if not os.path.exists(FOOD_HISTORY_FILE):
+        return jsonify({"error": "No history yet. Call /fatsecret/sync-month first."}), 404
+
+    with open(FOOD_HISTORY_FILE, encoding="utf-8") as f:
+        history = json.load(f)
+
+    date_param  = request.args.get("date")
+    month_param = request.args.get("month")
+
+    if date_param:
+        day = history.get(date_param)
+        if not day:
+            return jsonify({"error": f"No data for {date_param}"}), 404
+        return jsonify(day)
+
+    if month_param:
+        filtered = {k: v for k, v in history.items() if k.startswith(month_param)}
+        return jsonify(filtered)
+
+    # No filter → summary (list of dates + daily totals, no full item lists)
+    summary = {}
+    for date_str, day in history.items():
+        summary[date_str] = {
+            "total": day.get("total", {}),
+            "meals": {m: len(items) for m, items in day.get("meals", {}).items() if items},
+        }
+    return jsonify({"dates": len(history), "data": summary})
+
+
 # ── NUTRITION DETAIL ──────────────────────────────────────────────────────────
 
 def _parse_fs_entries(data, date_str=None):
