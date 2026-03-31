@@ -330,12 +330,16 @@ def all_today():
     except Exception as e:
         result["stress_timeline"] = {"error": str(e)}
 
-    # Respiration
+    # Respiration Rate (overnight)
     try:
-        resp = garmin_call(lambda g: g.get_respiration_data(date_today))
-        result["respiration"] = resp
+        resp_data = garmin_call(lambda g: g.get_respiration_data(date_today))
+        result["respiration"] = {
+            "avg_waking": resp_data.get("avgWakingRespirationValue"),
+            "avg_sleep": resp_data.get("avgSleepRespirationValue"),
+            "avg_overnight": resp_data.get("avgOvernightRespirationValue"),
+        }
     except Exception as e:
-        result["respiration"] = {"error": str(e)}
+        result["respiration"] = {"avg_waking": None, "avg_sleep": None, "avg_overnight": None}
 
     # SpO2
     try:
@@ -488,6 +492,17 @@ def all_day():
         result["spo2"] = spo2
     except Exception as e:
         result["spo2"] = {"error": str(e)}
+
+    # Respiration Rate (overnight)
+    try:
+        resp_data = garmin_call(lambda g: g.get_respiration_data(date_str))
+        result["respiration"] = {
+            "avg_waking": resp_data.get("avgWakingRespirationValue"),
+            "avg_sleep": resp_data.get("avgSleepRespirationValue"),
+            "avg_overnight": resp_data.get("avgOvernightRespirationValue"),
+        }
+    except Exception as e:
+        result["respiration"] = {"avg_waking": None, "avg_sleep": None, "avg_overnight": None}
 
     # Activities on that specific day
     try:
@@ -1626,7 +1641,7 @@ SHEET_HEADERS = [
     "HRV (мс)", "HRV норма недели", "Пульс покоя", "Пульс норма 7д",
     "Body Battery утром", "Body Battery вечером", "Израсходовано BB",
     "Стресс средний", "Стресс пик", "Шаги", "Активные калории",
-    "Температура кожи", "Тренировки", "SpO2",
+    "Температура кожи", "Тренировки", "SpO2", "Дыхание (вд/мин)",
     "Калории (еда)", "Белки (г)", "Жиры (г)", "Углеводы (г)",
     # ── новые колонки HealthyBot 2.0 ──
     "purine_score", "beer_ml",
@@ -1746,6 +1761,16 @@ def _collect_day_data(date_str):
     except Exception:
         d["spo2"] = None
 
+    # Respiration Rate (overnight)
+    try:
+        resp_data = garmin_call(lambda g: g.get_respiration_data(date_str))
+        if isinstance(resp_data, dict):
+            d["respiration"] = resp_data.get("avgOvernightRespirationValue")
+        else:
+            d["respiration"] = None
+    except Exception:
+        d["respiration"] = None
+
     # Nutrition (FatSecret scraper — individual items)
     try:
         if FATSECRET_USER and FATSECRET_PASS:
@@ -1788,6 +1813,7 @@ def _day_data_to_row(date_str, d):
         d.get("skin_temp"),
         d.get("workouts"),
         d.get("spo2"),
+        d.get("respiration"),
         d.get("food_calories"),
         d.get("food_protein"),
         d.get("food_fat"),
