@@ -336,7 +336,7 @@ def all_today():
         result["respiration"] = {
             "avg_waking": resp_data.get("avgWakingRespirationValue"),
             "avg_sleep": resp_data.get("avgSleepRespirationValue"),
-            "avg_overnight": resp_data.get("avgOvernightRespirationValue"),
+            "avg_overnight": resp_data.get("avgSleepRespirationValue"),
         }
     except Exception as e:
         result["respiration"] = {"avg_waking": None, "avg_sleep": None, "avg_overnight": None}
@@ -499,7 +499,7 @@ def all_day():
         result["respiration"] = {
             "avg_waking": resp_data.get("avgWakingRespirationValue"),
             "avg_sleep": resp_data.get("avgSleepRespirationValue"),
-            "avg_overnight": resp_data.get("avgOvernightRespirationValue"),
+            "avg_overnight": resp_data.get("avgSleepRespirationValue"),
         }
     except Exception as e:
         result["respiration"] = {"avg_waking": None, "avg_sleep": None, "avg_overnight": None}
