@@ -10,7 +10,23 @@ from functools import wraps
 from flask import Flask, jsonify, request, redirect
 from garminconnect import Garmin
 
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    from apscheduler.triggers.cron import CronTrigger
+    _APSCHEDULER_AVAILABLE = True
+except ImportError:
+    _APSCHEDULER_AVAILABLE = False
+
 app = Flask(__name__)
+
+# ── Scheduler state ──────────────────────────────────────────────────────────
+_scheduler_state = {
+    "last_run": None,       # ISO datetime of last run
+    "last_status": None,    # "ok" | "error"
+    "last_error": None,     # error message if failed
+    "health_action": None,  # "appended" | "updated" | "error"
+    "nutrition_rows": None, # int rows written
+}
 
 
 @app.after_request
@@ -377,6 +393,137 @@ def all_today():
                     "updated_at": fs_data.get("updated_at"),
                 }
         result["nutrition"] = nutrition_data or {"note": "No nutrition data for today yet"}
+    except Exception as e:
+        result["nutrition"] = {"error": str(e)}
+
+    return jsonify(result)
+
+
+# ── ALL DAY (historical: same as all-today but for a specific date) ────────────
+@app.route("/all-day")
+@require_api_key
+def all_day():
+    date_str = request.args.get("date")
+    if not date_str:
+        return jsonify({"error": "date parameter required (YYYY-MM-DD)"}), 400
+    try:
+        datetime.date.fromisoformat(date_str)
+    except ValueError:
+        return jsonify({"error": "invalid date format, use YYYY-MM-DD"}), 400
+
+    result = {}
+    result["date"] = date_str
+
+    # Sleep
+    try:
+        sleep = garmin_call(lambda g: g.get_sleep_data(date_str))
+        sd = sleep.get("dailySleepDTO", {}) if isinstance(sleep, dict) else {}
+        result["sleep"] = {
+            "score": sd.get("sleepScores", {}).get("overall", {}).get("value") if isinstance(sd.get("sleepScores"), dict) else None,
+            "duration_seconds": sd.get("sleepTimeSeconds"),
+            "deep_seconds": sd.get("deepSleepSeconds"),
+            "light_seconds": sd.get("lightSleepSeconds"),
+            "rem_seconds": sd.get("remSleepSeconds"),
+            "awake_seconds": sd.get("awakeSleepSeconds"),
+            "avg_overnight_hrv": sleep.get("avgOvernightHrv"),
+            "avg_skin_temp_deviation_c": sleep.get("avgSkinTempDeviationC"),
+            "breathing_disruptions": sleep.get("breathingDisruptionIndex"),
+        }
+    except Exception as e:
+        result["sleep"] = {"error": str(e)}
+
+    # HRV
+    try:
+        hrv = garmin_call(lambda g: g.get_hrv_data(date_str))
+        hs = hrv.get("hrvSummary", {}) if isinstance(hrv, dict) else {}
+        result["hrv"] = {
+            "weekly_avg": hs.get("weeklyAvg"),
+            "last_night_avg": hs.get("lastNightAvg"),
+            "last_night_5_min_high": hs.get("lastNight5MinHigh"),
+            "status": hs.get("status"),
+        }
+    except Exception as e:
+        result["hrv"] = {"error": str(e)}
+
+    # Daily stats
+    try:
+        stats = garmin_call(lambda g: g.get_stats(date_str))
+        result["daily_stats"] = {
+            "steps": stats.get("totalSteps"),
+            "distance_m": stats.get("totalDistanceMeters"),
+            "active_calories": stats.get("activeKilocalories"),
+            "bmr_calories": stats.get("bmrKilocalories"),
+            "floors_ascended": round(stats.get("floorsAscended", 0) or 0),
+            "moderate_intensity_min": stats.get("moderateIntensityMinutes"),
+            "vigorous_intensity_min": stats.get("vigorousIntensityMinutes"),
+            "resting_hr": stats.get("restingHeartRate"),
+            "resting_hr_7day_avg": stats.get("lastSevenDaysAvgRestingHeartRate"),
+            "avg_stress": stats.get("averageStressLevel"),
+            "max_stress": stats.get("maxStressLevel"),
+            "body_battery_wake": stats.get("bodyBatteryAtWakeTime"),
+        }
+    except Exception as e:
+        result["daily_stats"] = {"error": str(e)}
+
+    # Body battery
+    try:
+        day_stats = garmin_call(lambda g: g.get_stats(date_str))
+        current_level = day_stats.get("bodyBatteryMostRecentValue") if isinstance(day_stats, dict) else None
+        wake_level = result.get("daily_stats", {}).get("body_battery_wake")
+        net_used = None
+        if wake_level is not None and current_level is not None:
+            net_used = max(0, wake_level - current_level)
+        result["body_battery"] = {
+            "current_level": current_level,
+            "net_used_since_wake": net_used,
+            "highest": day_stats.get("bodyBatteryHighestValue") if isinstance(day_stats, dict) else None,
+            "lowest": day_stats.get("bodyBatteryLowestValue") if isinstance(day_stats, dict) else None,
+        }
+    except Exception as e:
+        result["body_battery"] = {"error": str(e)}
+
+    # SpO2
+    try:
+        spo2 = garmin_call(lambda g: g.get_spo2_data(date_str))
+        result["spo2"] = spo2
+    except Exception as e:
+        result["spo2"] = {"error": str(e)}
+
+    # Activities on that specific day
+    try:
+        acts = garmin_call(lambda g: g.get_activities_by_date(date_str, date_str))
+        result["recent_activities"] = [
+            {
+                "name": a.get("activityName"),
+                "type": a.get("activityType", {}).get("typeKey"),
+                "date": a.get("startTimeLocal"),
+                "duration_sec": a.get("duration"),
+                "distance_m": a.get("distance"),
+                "avg_hr": a.get("averageHR"),
+                "calories": a.get("calories"),
+            }
+            for a in (acts or [])
+        ]
+    except Exception as e:
+        result["recent_activities"] = {"error": str(e)}
+
+    # Nutrition from local diary file (by date key)
+    try:
+        nutrition_data = None
+        if os.path.exists(FOOD_DIARY_FILE):
+            with open(FOOD_DIARY_FILE, encoding="utf-8") as f:
+                all_diary = json.load(f)
+            if isinstance(all_diary, dict) and "entries" not in all_diary:
+                day_data = all_diary.get(date_str, {})
+                if day_data.get("total") and day_data["total"].get("calories", 0) > 0:
+                    nutrition_data = {
+                        "date": date_str,
+                        "source": "pwa",
+                        "total": day_data.get("total"),
+                        "entries": day_data.get("entries", []),
+                        "updated_at": day_data.get("updated_at", date_str),
+                    }
+        result["nutrition"] = nutrition_data or {"note": f"No nutrition data for {date_str}"}
     except Exception as e:
         result["nutrition"] = {"error": str(e)}
 
@@ -868,6 +1015,57 @@ def fatsecret_update_form():
     return "<html><body><script>window.close();</script><p>✅ FatSecret данные сохранены: " + data["updated_at"] + "</p></body></html>"
 
 
+@app.route("/fatsecret/debug-login")
+@require_api_key
+def fatsecret_debug_login():
+    """Debug: try FatSecret login and return diagnostic info."""
+    try:
+        session = requests.Session()
+        session.headers["User-Agent"] = _FS_BROWSER
+
+        login_page = session.get(FS_LOGIN_URL, timeout=15)
+        has_vs = "__VIEWSTATE" in login_page.text
+        has_cf = "cloudflare" in login_page.text.lower() or "just a moment" in login_page.text.lower()
+
+        vs_m  = re.search(r'id="__VIEWSTATE"\s+value="([^"]+)"', login_page.text)
+        vsg_m = re.search(r'id="__VIEWSTATEGENERATOR"\s+value="([^"]+)"', login_page.text)
+        ev_m  = re.search(r'id="__EVENTVALIDATION"\s+value="([^"]+)"', login_page.text)
+
+        login_data = {
+            "__EVENTTARGET": "", "__EVENTARGUMENT": "",
+            "__VIEWSTATE": vs_m.group(1) if vs_m else "",
+            "__VIEWSTATEGENERATOR": vsg_m.group(1) if vsg_m else "",
+            "__EVENTVALIDATION": ev_m.group(1) if ev_m else "",
+            "ctl00$ctl11$Logincontrol1$Name": FATSECRET_USER,
+            "ctl00$ctl11$Logincontrol1$Password": FATSECRET_PASS,
+            "ctl00$ctl11$Logincontrol1$Login": "Log In",
+        }
+        login_resp = session.post(FS_LOGIN_URL, data=login_data,
+                                  timeout=15, allow_redirects=True)
+        has_signout = "sign out" in login_resp.text.lower()
+        has_cf_post = "cloudflare" in login_resp.text.lower() or "just a moment" in login_resp.text.lower()
+        # Check for common error patterns
+        has_error = bool(re.search(r'class="[^"]*error[^"]*"', login_resp.text, re.I))
+        title_m = re.search(r'<title>([^<]+)</title>', login_resp.text)
+
+        return jsonify({
+            "get_status": login_page.status_code,
+            "get_has_viewstate": has_vs,
+            "get_cloudflare": has_cf,
+            "post_status": login_resp.status_code,
+            "post_url": login_resp.url,
+            "post_has_signout": has_signout,
+            "post_cloudflare": has_cf_post,
+            "post_has_error": has_error,
+            "post_title": title_m.group(1).strip() if title_m else None,
+            "user_set": bool(FATSECRET_USER),
+            "pass_set": bool(FATSECRET_PASS),
+            "user_len": len(FATSECRET_USER),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/fatsecret/sync")
 @require_api_key
 def fatsecret_sync():
@@ -899,9 +1097,12 @@ def fatsecret_diary():
 FOOD_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "food_history.json")
 
 
-def _fs_scrape_month(year, month):
-    """Login once, scrape every day of the month. Returns {date_str: {...}}."""
+def _fs_scrape_month(year, month, skip_dates=None):
+    """Login once, scrape every day of the month. Returns {date_str: {...}}.
+    skip_dates: optional set of date strings to skip (for incremental sync).
+    """
     import calendar
+    import time as _time
     if not FATSECRET_USER or not FATSECRET_PASS:
         raise RuntimeError("FATSECRET_USER / FATSECRET_PASS not set")
 
@@ -924,6 +1125,8 @@ def _fs_scrape_month(year, month):
         "ctl00$ctl11$Logincontrol1$Login": "Log In",
     }
     login_resp = session.post(FS_LOGIN_URL, data=login_data, timeout=15, allow_redirects=True)
+    if login_resp.status_code == 429:
+        raise RuntimeError("FatSecret rate limit (429) — попробуйте позже")
     if "Sign out" not in login_resp.text and "sign out" not in login_resp.text.lower():
         raise RuntimeError("FatSecret login failed — check credentials")
 
@@ -937,9 +1140,12 @@ def _fs_scrape_month(year, month):
         if d > today:
             break
         date_str = d.isoformat()
+        if skip_dates and date_str in skip_dates:
+            continue
         dd = (d - epoch).days
         url = FS_DIARY_URL + f"&dd={dd}&dt={dd}"
         try:
+            _time.sleep(2)  # rate limit protection
             resp = session.get(url, timeout=15)
             resp.raise_for_status()
             parsed = _fs_parse_diary_items(resp.text)
@@ -968,16 +1174,20 @@ def fatsecret_sync_month():
     except ValueError:
         return jsonify({"error": "Invalid year/month params"}), 400
 
-    try:
-        month_data = _fs_scrape_month(year, month)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    # Load existing history and merge (keeps other months intact)
+    # Load existing history
     history = {}
     if os.path.exists(FOOD_HISTORY_FILE):
         with open(FOOD_HISTORY_FILE, encoding="utf-8") as f:
             history = json.load(f)
+
+    # If only_missing=1, skip dates already in history
+    only_missing = request.args.get("only_missing", "0") == "1"
+    skip_dates = set(history.keys()) if only_missing else None
+
+    try:
+        month_data = _fs_scrape_month(year, month, skip_dates=skip_dates)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
     history.update(month_data)
     history = dict(sorted(history.items()))  # sort by date
@@ -1418,7 +1628,17 @@ SHEET_HEADERS = [
     "Стресс средний", "Стресс пик", "Шаги", "Активные калории",
     "Температура кожи", "Тренировки", "SpO2",
     "Калории (еда)", "Белки (г)", "Жиры (г)", "Углеводы (г)",
+    # ── новые колонки HealthyBot 2.0 ──
+    "purine_score", "beer_ml",
+    "morning_alerts", "evening_alerts",
+    "day_status", "conclusion", "task_tomorrow",
 ]
+
+ACTIVE_ISSUES_HEADERS = [
+    "issue_id", "date_opened", "type", "description",
+    "status", "history", "date_closed",
+]
+ACTIVE_ISSUES_SHEET = "Active Issues"
 
 _sheet_ws = None
 
@@ -1572,6 +1792,14 @@ def _day_data_to_row(date_str, d):
         d.get("food_protein"),
         d.get("food_fat"),
         d.get("food_carbs"),
+        # ── HealthyBot 2.0 columns (filled by n8n, left empty on initial write) ──
+        d.get("purine_score", ""),
+        d.get("beer_ml", ""),
+        d.get("morning_alerts", ""),
+        d.get("evening_alerts", ""),
+        d.get("day_status", ""),
+        d.get("conclusion", ""),
+        d.get("task_tomorrow", ""),
     ]
 
 
@@ -1785,6 +2013,7 @@ def sheets_fill_nutrition_from_history():
     ?month=YYYY-MM  — filter to one month (optional)
     Clears existing data for those dates before writing.
     """
+    global _nutrition_ws
     month_filter = request.args.get("month")
     if not os.path.exists(FOOD_HISTORY_FILE):
         return jsonify({"error": "food_history.json not found"}), 404
@@ -1795,27 +2024,263 @@ def sheets_fill_nutrition_from_history():
         history = {k: v for k, v in history.items() if k.startswith(month_filter)}
 
     try:
+        _nutrition_ws = None  # reset cache to avoid stale reference
         ws = get_nutrition_sheet()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Remove all rows for the affected dates
-    all_values = ws.get_all_values()
-    affected_dates = set(history.keys())
-    rows_to_delete = [
-        i + 1 for i, row in enumerate(all_values)
-        if i > 0 and row and row[0] in affected_dates
-    ]
-    for ri in reversed(rows_to_delete):
-        ws.delete_rows(ri)
+    try:
+        # Read existing data, keep rows NOT in affected dates
+        all_values = ws.get_all_values()
+        affected_dates = set(history.keys())
+        keep_rows = [all_values[0]]  # header
+        for row in all_values[1:]:
+            if row and row[0] not in affected_dates:
+                keep_rows.append(row)
 
-    # Build all rows
-    all_new_rows = []
-    for date_str in sorted(history.keys()):
-        meals = history[date_str].get("meals", {})
+        # Build new rows from history
+        new_rows = []
+        for date_str in sorted(history.keys()):
+            meals = history[date_str].get("meals", {})
+            for meal_key in ["breakfast", "lunch", "dinner", "other"]:
+                for item in meals.get(meal_key, []):
+                    new_rows.append([
+                        date_str,
+                        MEAL_RU.get(meal_key, meal_key),
+                        item.get("name", ""),
+                        item.get("calories", 0),
+                        item.get("protein", 0),
+                        item.get("fat", 0),
+                        item.get("carbs", 0),
+                    ])
+
+        # Combine: kept rows + new rows, sort by date (skip header)
+        all_data = keep_rows[0:1] + sorted(keep_rows[1:] + new_rows, key=lambda r: r[0])
+
+        # Clear sheet and write all at once (1 clear + 1 update = 2 API calls)
+        ws.clear()
+        ws.update(range_name="A1", values=all_data)
+        ws.format("A1:G1", {"textFormat": {"bold": True}})
+
+        return jsonify({
+            "status": "ok",
+            "month": month_filter or "all",
+            "dates_processed": len(history),
+            "rows_written": len(new_rows),
+            "total_rows": len(all_data) - 1,
+        })
+    except Exception as e:
+        return jsonify({"error": f"Sheets error: {str(e)}"}), 500
+
+
+_active_issues_ws = None
+
+
+def get_active_issues_sheet():
+    """Get or create the 'Active Issues' worksheet."""
+    global _active_issues_ws
+    if _active_issues_ws is not None:
+        return _active_issues_ws
+    import gspread
+    if os.path.exists(CREDENTIALS_FILE):
+        gc = gspread.service_account(filename=CREDENTIALS_FILE)
+    else:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+        if not creds_json:
+            raise RuntimeError("Google credentials not found")
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        ws = sh.worksheet(ACTIVE_ISSUES_SHEET)
+    except Exception:
+        ws = sh.add_worksheet(title=ACTIVE_ISSUES_SHEET, rows=500, cols=7)
+    first_row = ws.row_values(1)
+    if first_row != ACTIVE_ISSUES_HEADERS:
+        ws.update(range_name="A1", values=[ACTIVE_ISSUES_HEADERS])
+        ws.format("A1:G1", {"textFormat": {"bold": True}})
+    _active_issues_ws = ws
+    return ws
+
+
+@app.route("/sheets/active-issues")
+@require_api_key
+def sheets_get_active_issues():
+    """Return all rows from Active Issues sheet.
+    ?status=ОТКРЫТ  — filter by status (optional)
+    """
+    try:
+        global _active_issues_ws
+        _active_issues_ws = None
+        ws = get_active_issues_sheet()
+        rows = ws.get_all_records(expected_headers=ACTIVE_ISSUES_HEADERS)
+        status_filter = request.args.get("status")
+        if status_filter:
+            rows = [r for r in rows if r.get("status") == status_filter]
+        return jsonify({"count": len(rows), "issues": rows})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/sheets/active-issues/open", methods=["POST"])
+@require_api_key
+def sheets_open_issue():
+    """Open a new issue in Active Issues sheet.
+    JSON body: {type, description}
+    """
+    data = request.get_json(force=True) or {}
+    issue_type = data.get("type", "ДРУГОЕ")
+    description = data.get("description", "")
+    if not description:
+        return jsonify({"error": "description required"}), 400
+    try:
+        global _active_issues_ws
+        _active_issues_ws = None
+        ws = get_active_issues_sheet()
+        all_rows = ws.get_all_values()
+        # Generate next issue_id
+        issue_num = len(all_rows)  # header + data rows
+        issue_id = f"{issue_num:03d}"
+        today = datetime.date.today().isoformat()
+        new_row = [issue_id, today, issue_type, description, "ОТКРЫТ", "", ""]
+        ws.append_row(new_row)
+        return jsonify({"status": "ok", "issue_id": issue_id, "date_opened": today})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/sheets/active-issues/update", methods=["POST"])
+@require_api_key
+def sheets_update_issue():
+    """Append a history line or close an issue.
+    JSON body: {issue_id, history_line, close: bool}
+    """
+    data = request.get_json(force=True) or {}
+    issue_id = str(data.get("issue_id", ""))
+    history_line = data.get("history_line", "")
+    close = data.get("close", False)
+    if not issue_id:
+        return jsonify({"error": "issue_id required"}), 400
+    try:
+        global _active_issues_ws
+        _active_issues_ws = None
+        ws = get_active_issues_sheet()
+        all_values = ws.get_all_values()
+        headers = all_values[0]
+        col = {h: i for i, h in enumerate(headers)}
+        today = datetime.date.today().isoformat()
+        for i, row in enumerate(all_values[1:], start=2):
+            if row and row[col["issue_id"]] == issue_id:
+                if history_line:
+                    old_hist = row[col["history"]]
+                    new_hist = (old_hist + "\n" + f"{today}: {history_line}").strip()
+                    ws.update_cell(i, col["history"] + 1, new_hist)
+                if close:
+                    ws.update_cell(i, col["status"] + 1, "ЗАКРЫТ")
+                    ws.update_cell(i, col["date_closed"] + 1, today)
+                return jsonify({"status": "ok", "issue_id": issue_id, "closed": close})
+        return jsonify({"error": f"issue_id {issue_id} not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/sheets/update-day-fields", methods=["POST"])
+@require_api_key
+def sheets_update_day_fields():
+    """Update specific fields in Daily Metrics for a date.
+    JSON body: {date, fields: {purine_score, beer_ml, morning_alerts, evening_alerts, day_status, conclusion, task_tomorrow}}
+    Used by n8n Code nodes to write back computed values.
+    """
+    data = request.get_json(force=True) or {}
+    date_str = data.get("date", datetime.date.today().isoformat())
+    fields = data.get("fields", {})
+    if not fields:
+        return jsonify({"error": "fields required"}), 400
+    try:
+        global _sheet_ws
+        _sheet_ws = None
+        ws = get_sheet()
+        dates_col = ws.col_values(1)
+        try:
+            row_idx = dates_col.index(date_str) + 1
+        except ValueError:
+            return jsonify({"error": f"Date {date_str} not found in sheet"}), 404
+
+        col_map = {h: i + 1 for i, h in enumerate(SHEET_HEADERS)}
+        updated = {}
+        for field, value in fields.items():
+            if field in col_map:
+                ws.update_cell(row_idx, col_map[field], value)
+                updated[field] = value
+        return jsonify({"status": "ok", "date": date_str, "updated": updated})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _daily_save_to_sheets(offset_days=1):
+    """Scheduled job: save health + nutrition data to Google Sheets.
+    offset_days=1 → yesterday (06:00 job, full data incl. sleep)
+    offset_days=0 → today     (22:30 job, nutrition + day activity)
+    Never raises — so scheduler stays alive.
+    """
+    global _sheet_ws, _nutrition_ws
+    date_str = (datetime.date.today() - datetime.timedelta(days=offset_days)).isoformat()
+    app.logger.info("[scheduler] Starting daily save for %s", date_str)
+    run_time = datetime.datetime.now().isoformat()
+    errors = []
+
+    # ── 1. Health Data → "Health Data" sheet ─────────────────────────────────
+    try:
+        _sheet_ws = None  # reset cache
+        ws = get_sheet()
+        dates_col = ws.col_values(1)
+        try:
+            row_idx = dates_col.index(date_str) + 1
+            row_exists = True
+        except ValueError:
+            row_idx = None
+            row_exists = False
+
+        data = _collect_day_data(date_str)
+        row  = _day_data_to_row(date_str, data)
+
+        if row_exists:
+            ws.update(values=[row], range_name=f"A{row_idx}", value_input_option="RAW")
+            health_action = "updated"
+        else:
+            ws.append_row(row, value_input_option="RAW")
+            health_action = "appended"
+        app.logger.info("[scheduler] Health Data %s for %s", health_action, date_str)
+        _scheduler_state["health_action"] = health_action
+    except Exception as e:
+        app.logger.error("[scheduler] Health Data error: %s", e)
+        errors.append(f"health: {e}")
+        _scheduler_state["health_action"] = "error"
+
+    # ── 2. FatSecret → food_history.json + "Питание" sheet ───────────────────
+    try:
+        nutrition = _fs_scrape_items(date_str)
+
+        # Save to food_history.json
+        history = {}
+        if os.path.exists(FOOD_HISTORY_FILE):
+            with open(FOOD_HISTORY_FILE, encoding="utf-8") as f:
+                history = json.load(f)
+        history[date_str] = nutrition
+        history = dict(sorted(history.items()))
+        with open(FOOD_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+
+        # Write to "Питание" sheet (replace rows for this date)
+        _nutrition_ws = None  # reset cache
+        nws = get_nutrition_sheet()
+        all_values = nws.get_all_values()
+
+        # Keep all rows except this date, then append new rows
+        keep = [all_values[0]] + [r for r in all_values[1:] if r and r[0] != date_str]
+        new_rows = []
         for meal_key in ["breakfast", "lunch", "dinner", "other"]:
-            for item in meals.get(meal_key, []):
-                all_new_rows.append([
+            for item in nutrition.get("meals", {}).get(meal_key, []):
+                new_rows.append([
                     date_str,
                     MEAL_RU.get(meal_key, meal_key),
                     item.get("name", ""),
@@ -1825,17 +2290,85 @@ def sheets_fill_nutrition_from_history():
                     item.get("carbs", 0),
                 ])
 
-    if all_new_rows:
-        # Write in batches of 500 to avoid API limits
-        for i in range(0, len(all_new_rows), 500):
-            ws.append_rows(all_new_rows[i:i+500], value_input_option="RAW")
+        all_data = keep + sorted(new_rows, key=lambda r: r[0])
+        nws.clear()
+        nws.update(range_name="A1", values=all_data)
+        nws.format("A1:G1", {"textFormat": {"bold": True}})
 
-    return jsonify({
-        "status": "ok",
-        "month": month_filter or "all",
-        "dates_processed": len(history),
-        "rows_written": len(all_new_rows),
-    })
+        app.logger.info("[scheduler] Nutrition: %d rows written for %s", len(new_rows), date_str)
+        _scheduler_state["nutrition_rows"] = len(new_rows)
+    except Exception as e:
+        app.logger.error("[scheduler] Nutrition error: %s", e)
+        errors.append(f"nutrition: {e}")
+        _scheduler_state["nutrition_rows"] = -1
+
+    # ── Update state ──────────────────────────────────────────────────────────
+    _scheduler_state["last_run"] = run_time
+    if errors:
+        _scheduler_state["last_status"] = "error"
+        _scheduler_state["last_error"] = "; ".join(errors)
+        app.logger.warning("[scheduler] Finished with errors: %s", errors)
+    else:
+        _scheduler_state["last_status"] = "ok"
+        _scheduler_state["last_error"] = None
+        app.logger.info("[scheduler] Daily save complete for %s", date_str)
+
+
+@app.route("/scheduler/status")
+@require_api_key
+def scheduler_status():
+    """Return current scheduler state and next run times."""
+    info = dict(_scheduler_state)
+    if _APSCHEDULER_AVAILABLE and _scheduler is not None:
+        info["scheduler_running"] = _scheduler.running
+        for job_id in ("daily_sheets_morning", "daily_sheets_evening"):
+            job = _scheduler.get_job(job_id)
+            info[job_id] = job.next_run_time.isoformat() if job and job.next_run_time else None
+    else:
+        info["scheduler_running"] = False
+        info["warning"] = "APScheduler not available — install it: pip install APScheduler==3.10.4"
+    return jsonify(info)
+
+
+@app.route("/scheduler/run-now")
+@require_api_key
+def scheduler_run_now():
+    """Manually trigger the daily save job.
+    ?offset=0  → today's data (default)
+    ?offset=1  → yesterday's data
+    """
+    import threading
+    offset = int(request.args.get("offset", 0))
+    t = threading.Thread(target=_daily_save_to_sheets, kwargs={"offset_days": offset}, daemon=True)
+    t.start()
+    date_label = "today" if offset == 0 else "yesterday"
+    return jsonify({"status": "started", "date": date_label, "message": "Running in background. Check /scheduler/status in ~60s."})
+
+
+# ── Start APScheduler ─────────────────────────────────────────────────────────
+_scheduler = None
+if _APSCHEDULER_AVAILABLE:
+    _scheduler = BackgroundScheduler(timezone="Europe/Moscow")
+    # 06:00 — финальные данные за вчера (сон + активность + питание, всё завершено)
+    _scheduler.add_job(
+        _daily_save_to_sheets,
+        CronTrigger(hour=6, minute=0),
+        id="daily_sheets_morning",
+        kwargs={"offset_days": 1},
+        misfire_grace_time=3600,
+        replace_existing=True,
+    )
+    # 22:30 — текущие данные за сегодня (питание уже введено, активность за день)
+    _scheduler.add_job(
+        _daily_save_to_sheets,
+        CronTrigger(hour=22, minute=30),
+        id="daily_sheets_evening",
+        kwargs={"offset_days": 0},
+        misfire_grace_time=1800,
+        replace_existing=True,
+    )
+    _scheduler.start()
+    app.logger.info("[scheduler] APScheduler started — saves at 06:00 (yesterday) and 22:30 (today) MSK")
 
 
 if __name__ == "__main__":
