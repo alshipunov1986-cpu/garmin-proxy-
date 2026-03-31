@@ -1406,8 +1406,9 @@ def food_diary_delete():
 
 
 # ── GOOGLE SHEETS ─────────────────────────────────────────────────────────────
-SPREADSHEET_ID   = "1bGEHnrvpCL6C_lwayP55W3oggNE4CKZQONOSeJLDCEc"
-SHEET_NAME       = "Health Data"
+SPREADSHEET_ID        = "1bGEHnrvpCL6C_lwayP55W3oggNE4CKZQONOSeJLDCEc"
+SHEET_NAME            = "Health Data"
+NUTRITION_SHEET_NAME  = "Питание"
 CREDENTIALS_FILE = os.path.join(os.path.dirname(__file__), "google_credentials.json")
 
 SHEET_HEADERS = [
@@ -1525,19 +1526,22 @@ def _collect_day_data(date_str):
     except Exception:
         d["spo2"] = None
 
-    # Nutrition (FatSecret scraper)
+    # Nutrition (FatSecret scraper — individual items)
     try:
         if FATSECRET_USER and FATSECRET_PASS:
-            fs = _fs_scrape(date_str)
+            fs = _fs_scrape_items(date_str)
             total = fs.get("total") or {}
             d["food_calories"] = total.get("calories")
             d["food_protein"]  = total.get("protein")
             d["food_fat"]      = total.get("fat")
             d["food_carbs"]    = total.get("carbs")
+            d["food_items"]    = fs.get("meals", {})  # full items dict for detail sheet
         else:
-            d.update({"food_calories": None, "food_protein": None, "food_fat": None, "food_carbs": None})
+            d.update({"food_calories": None, "food_protein": None,
+                      "food_fat": None, "food_carbs": None, "food_items": {}})
     except Exception:
-        d.update({"food_calories": None, "food_protein": None, "food_fat": None, "food_carbs": None})
+        d.update({"food_calories": None, "food_protein": None,
+                  "food_fat": None, "food_carbs": None, "food_items": {}})
 
     return d
 
@@ -1622,6 +1626,156 @@ def sheets_history():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+_nutrition_ws = None
+
+NUTRITION_HEADERS = ["Дата", "Приём пищи", "Продукт", "Калории", "Белки (г)", "Жиры (г)", "Углеводы (г)"]
+
+MEAL_RU = {"breakfast": "Завтрак", "lunch": "Обед", "dinner": "Ужин", "other": "Другое"}
+
+
+def get_nutrition_sheet():
+    """Get or create the 'Питание' worksheet."""
+    global _nutrition_ws
+    if _nutrition_ws is not None:
+        return _nutrition_ws
+    import gspread
+    if os.path.exists(CREDENTIALS_FILE):
+        gc = gspread.service_account(filename=CREDENTIALS_FILE)
+    else:
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS")
+        if not creds_json:
+            raise RuntimeError("Google credentials not found")
+        gc = gspread.service_account_from_dict(json.loads(creds_json))
+    sh = gc.open_by_key(SPREADSHEET_ID)
+    try:
+        ws = sh.worksheet(NUTRITION_SHEET_NAME)
+    except Exception:
+        ws = sh.add_worksheet(title=NUTRITION_SHEET_NAME, rows=5000, cols=7)
+    first_row = ws.row_values(1)
+    if first_row != NUTRITION_HEADERS:
+        ws.update(range_name="A1", values=[NUTRITION_HEADERS])
+        ws.format("A1:G1", {"textFormat": {"bold": True}})
+    _nutrition_ws = ws
+    return ws
+
+
+@app.route("/sheets/save-nutrition")
+@require_api_key
+def sheets_save_nutrition():
+    """Scrape today's (or ?date=YYYY-MM-DD) food items and write to 'Питание' sheet.
+    Deletes existing rows for that date first to avoid duplicates.
+    Also saves to food_history.json.
+    """
+    date_str = request.args.get("date", datetime.date.today().isoformat())
+    try:
+        # Scrape individual items
+        result = _fs_scrape_items(date_str)
+        result["date"] = date_str
+
+        # Save to food_history.json
+        history = {}
+        if os.path.exists(FOOD_HISTORY_FILE):
+            with open(FOOD_HISTORY_FILE, encoding="utf-8") as f:
+                history = json.load(f)
+        history[date_str] = result
+        history = dict(sorted(history.items()))
+        with open(FOOD_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+
+        # Write to Google Sheets "Питание" tab
+        ws = get_nutrition_sheet()
+        all_values = ws.get_all_values()
+
+        # Delete existing rows for this date (skip header row 0)
+        rows_to_delete = [
+            i + 1 for i, row in enumerate(all_values)
+            if i > 0 and row and row[0] == date_str
+        ]
+        for row_idx in reversed(rows_to_delete):  # delete bottom-up
+            ws.delete_rows(row_idx)
+
+        # Build new rows
+        meals = result.get("meals", {})
+        new_rows = []
+        for meal_key in ["breakfast", "lunch", "dinner", "other"]:
+            items = meals.get(meal_key, [])
+            for item in items:
+                new_rows.append([
+                    date_str,
+                    MEAL_RU.get(meal_key, meal_key),
+                    item.get("name", ""),
+                    item.get("calories", 0),
+                    item.get("protein", 0),
+                    item.get("fat", 0),
+                    item.get("carbs", 0),
+                ])
+
+        if new_rows:
+            ws.append_rows(new_rows, value_input_option="RAW")
+
+        total = result.get("total", {})
+        return jsonify({
+            "status": "ok",
+            "date": date_str,
+            "items_written": len(new_rows),
+            "total": total,
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()[-500:]}), 500
+
+
+@app.route("/sheets/save-all")
+@require_api_key
+def sheets_save_all():
+    """Convenience: save both health metrics AND nutrition items for a date.
+    ?date=YYYY-MM-DD (default: yesterday for health, today for nutrition)
+    """
+    date_str = request.args.get("date", datetime.date.today().isoformat())
+    results = {}
+    try:
+        # Health metrics → Health Data sheet
+        ws = get_sheet()
+        dates_col = ws.col_values(1)
+        try:
+            row_idx = dates_col.index(date_str) + 1
+            row_exists = True
+        except ValueError:
+            row_idx = None
+            row_exists = False
+        data = _collect_day_data(date_str)
+        row = _day_data_to_row(date_str, data)
+        if row_exists:
+            ws.update(values=[row], range_name=f"A{row_idx}", value_input_option="RAW")
+            results["health"] = f"updated row {row_idx}"
+        else:
+            ws.append_row(row, value_input_option="RAW")
+            results["health"] = "appended"
+    except Exception as e:
+        results["health_error"] = str(e)
+    try:
+        # Nutrition items → Питание sheet (reuse already-scraped data from _collect_day_data)
+        nws = get_nutrition_sheet()
+        all_values = nws.get_all_values()
+        rows_to_delete = [i + 1 for i, r in enumerate(all_values) if i > 0 and r and r[0] == date_str]
+        for ri in reversed(rows_to_delete):
+            nws.delete_rows(ri)
+        meals = data.get("food_items", {})
+        new_rows = []
+        for meal_key in ["breakfast", "lunch", "dinner", "other"]:
+            for item in meals.get(meal_key, []):
+                new_rows.append([
+                    date_str, MEAL_RU.get(meal_key, meal_key),
+                    item.get("name", ""), item.get("calories", 0),
+                    item.get("protein", 0), item.get("fat", 0), item.get("carbs", 0),
+                ])
+        if new_rows:
+            nws.append_rows(new_rows, value_input_option="RAW")
+        results["nutrition"] = f"{len(new_rows)} items written"
+    except Exception as e:
+        results["nutrition_error"] = str(e)
+    return jsonify({"status": "ok", "date": date_str, **results})
 
 
 if __name__ == "__main__":
