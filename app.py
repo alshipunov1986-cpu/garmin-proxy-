@@ -675,6 +675,78 @@ def _fs_parse_diary(html):
     }
 
 
+def _fs_parse_diary_items(html):
+    """Parse FatSecret diary HTML → per-item structure with meal grouping.
+    Detects table.foodsNutritionTbl blocks: td.greytitlex = meal header,
+    remaining td cells (class 'normal') = fat/carbs/prot/cal of each item.
+    """
+    MEAL_MAP = {
+        "breakfast": "breakfast",
+        "lunch": "lunch",
+        "dinner": "dinner",
+        "snacks/other": "other",
+        "snacks": "other",
+    }
+    meals = {"breakfast": [], "lunch": [], "dinner": [], "other": []}
+    current_meal = "other"
+
+    table_pattern = re.compile(
+        r'<table[^>]*class="[^"]*foodsNutritionTbl[^"]*"[^>]*>(.*?)</table>',
+        re.DOTALL | re.IGNORECASE,
+    )
+
+    def _strip(s):
+        s = re.sub(r'<[^>]+>', ' ', s)
+        return re.sub(r'\s+', ' ', s).strip()
+
+    def _num(s):
+        s = _strip(s)
+        try:
+            return float(s) if s else 0.0
+        except ValueError:
+            return 0.0
+
+    for m in table_pattern.finditer(html):
+        thtml = m.group(1)
+        # Meal header: td.greytitlex
+        hdr = re.search(r'<td[^>]*class="[^"]*greytitlex[^"]*"[^>]*>\s*([^<]+?)\s*</td>', thtml, re.I)
+        if hdr:
+            current_meal = MEAL_MAP.get(hdr.group(1).strip().lower(), "other")
+            continue
+        # Food item: first td (no special class), then 4× td.normal
+        cells = re.findall(r'<td([^>]*)>(.*?)</td>', thtml, re.DOTALL | re.I)
+        if len(cells) < 5:
+            continue
+        first_attrs, first_content = cells[0]
+        if 'greytitlex' in first_attrs or '"sub"' in first_attrs or "'sub'" in first_attrs:
+            continue
+        normal = [(a, c) for a, c in cells[1:] if 'normal' in a]
+        if len(normal) < 4:
+            continue
+        name = _strip(first_content)
+        if not name:
+            continue
+        fat      = round(_num(normal[0][1]), 2)
+        carbs    = round(_num(normal[1][1]), 2)
+        protein  = round(_num(normal[2][1]), 2)
+        calories = int(_num(normal[3][1]))
+        if calories == 0 and fat == 0 and protein == 0:
+            continue
+        meals[current_meal].append({
+            "name": name, "calories": calories,
+            "protein": protein, "fat": fat, "carbs": carbs,
+        })
+
+    all_items = [i for m in meals.values() for i in m]
+    total = {
+        "calories": sum(i["calories"] for i in all_items),
+        "protein":  round(sum(i["protein"] for i in all_items), 1),
+        "fat":      round(sum(i["fat"]     for i in all_items), 1),
+        "carbs":    round(sum(i["carbs"]   for i in all_items), 1),
+    }
+    return {"meals": meals, "total": total, "source": "fatsecret_scraper"}
+
+
 def _fs_scrape(date_str=None):
     """Login to FatSecret and scrape diary. Returns parsed dict.
     date_str: optional YYYY-MM-DD (default: today).
@@ -721,6 +793,51 @@ def _fs_scrape(date_str=None):
     result = _fs_parse_diary(diary_resp.text)
     if date_str:
         result["date"] = date_str
+    return result
+
+
+def _fs_scrape_items(date_str=None):
+    """Login to FatSecret and scrape individual food items with meal grouping.
+    Returns same format as _parse_fs_entries: {date, meals, total, source}.
+    """
+    if not FATSECRET_USER or not FATSECRET_PASS:
+        raise RuntimeError("FATSECRET_USER / FATSECRET_PASS not set")
+
+    session = requests.Session()
+    session.headers["User-Agent"] = _FS_BROWSER
+
+    login_page = session.get(FS_LOGIN_URL, timeout=15)
+    login_page.raise_for_status()
+
+    vs_m  = re.search(r'id="__VIEWSTATE"\s+value="([^"]+)"', login_page.text)
+    vsg_m = re.search(r'id="__VIEWSTATEGENERATOR"\s+value="([^"]+)"', login_page.text)
+    ev_m  = re.search(r'id="__EVENTVALIDATION"\s+value="([^"]+)"', login_page.text)
+
+    login_data = {
+        "__EVENTTARGET": "",
+        "__EVENTARGUMENT": "",
+        "__VIEWSTATE": vs_m.group(1) if vs_m else "",
+        "__VIEWSTATEGENERATOR": vsg_m.group(1) if vsg_m else "",
+        "__EVENTVALIDATION": ev_m.group(1) if ev_m else "",
+        "ctl00$ctl11$Logincontrol1$Name": FATSECRET_USER,
+        "ctl00$ctl11$Logincontrol1$Password": FATSECRET_PASS,
+        "ctl00$ctl11$Logincontrol1$Login": "Log In",
+    }
+    login_resp = session.post(FS_LOGIN_URL, data=login_data,
+                              timeout=15, allow_redirects=True)
+    if "Sign out" not in login_resp.text and "sign out" not in login_resp.text.lower():
+        raise RuntimeError("FatSecret login failed — check credentials")
+
+    url = FS_DIARY_URL
+    if date_str:
+        target = datetime.date.fromisoformat(date_str)
+        epoch = datetime.date(1970, 1, 1)
+        dd = (target - epoch).days
+        url += f"&dd={dd}&dt={dd}"
+    diary_resp = session.get(url, timeout=15)
+    diary_resp.raise_for_status()
+    result = _fs_parse_diary_items(diary_resp.text)
+    result["date"] = date_str or datetime.date.today().isoformat()
     return result
 
 
@@ -836,6 +953,15 @@ def nutrition_detail():
             return jsonify(_parse_fs_entries(data, date_param))
     except Exception as e:
         app.logger.warning("FatSecret API failed for nutrition-detail: %s", e)
+
+    # --- Source 1.5: FatSecret web scraper (login + parse items from HTML) ---
+    try:
+        result = _fs_scrape_items(date_param)
+        all_items = [i for m in result["meals"].values() for i in m]
+        if all_items:
+            return jsonify(result)
+    except Exception as e:
+        app.logger.warning("FatSecret scraper failed for nutrition-detail: %s", e)
 
     # --- Source 2: PWA food_diary.json (individual items, all in 'other') ---
     try:
