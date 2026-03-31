@@ -1685,8 +1685,28 @@ def get_sheet():
     # Ensure headers row is correct and complete
     first_row = ws.row_values(1)
     if first_row != SHEET_HEADERS:
+        # Check if new columns need to be inserted (not just renamed)
+        for new_col in SHEET_HEADERS:
+            if new_col not in first_row:
+                # Find where it should be inserted
+                new_idx = SHEET_HEADERS.index(new_col)  # 0-based target position
+                # Insert a blank column at that position (1-based for Sheets API)
+                ws.spreadsheet.batch_update({
+                    "requests": [{
+                        "insertDimension": {
+                            "range": {
+                                "sheetId": ws.id,
+                                "dimension": "COLUMNS",
+                                "startIndex": new_idx,
+                                "endIndex": new_idx + 1,
+                            },
+                            "inheritFromBefore": False,
+                        }
+                    }]
+                })
+                first_row.insert(new_idx, new_col)
         ws.update(range_name="A1", values=[SHEET_HEADERS])
-        ws.format("A1:W1", {"textFormat": {"bold": True}})
+        ws.format("A1:AE1", {"textFormat": {"bold": True}})
     _sheet_ws = ws
     return ws
 
