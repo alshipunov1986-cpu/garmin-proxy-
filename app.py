@@ -1785,7 +1785,7 @@ def _collect_day_data(date_str):
     try:
         resp_data = garmin_call(lambda g: g.get_respiration_data(date_str))
         if isinstance(resp_data, dict):
-            d["respiration"] = resp_data.get("avgOvernightRespirationValue")
+            d["respiration"] = resp_data.get("avgSleepRespirationValue")
         else:
             d["respiration"] = None
     except Exception:
