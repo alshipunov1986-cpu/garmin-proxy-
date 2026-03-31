@@ -696,7 +696,9 @@ def _fs_parse_diary_items(html):
     )
 
     def _strip(s):
+        import html as _html
         s = re.sub(r'<[^>]+>', ' ', s)
+        s = _html.unescape(s)
         return re.sub(r'\s+', ' ', s).strip()
 
     def _num(s):
