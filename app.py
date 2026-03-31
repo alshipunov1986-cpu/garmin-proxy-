@@ -1778,6 +1778,66 @@ def sheets_save_all():
     return jsonify({"status": "ok", "date": date_str, **results})
 
 
+@app.route("/sheets/fill-nutrition-from-history")
+@require_api_key
+def sheets_fill_nutrition_from_history():
+    """Write all dates from food_history.json into the 'Питание' Google Sheet.
+    ?month=YYYY-MM  — filter to one month (optional)
+    Clears existing data for those dates before writing.
+    """
+    month_filter = request.args.get("month")
+    if not os.path.exists(FOOD_HISTORY_FILE):
+        return jsonify({"error": "food_history.json not found"}), 404
+    with open(FOOD_HISTORY_FILE, encoding="utf-8") as f:
+        history = json.load(f)
+
+    if month_filter:
+        history = {k: v for k, v in history.items() if k.startswith(month_filter)}
+
+    try:
+        ws = get_nutrition_sheet()
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # Remove all rows for the affected dates
+    all_values = ws.get_all_values()
+    affected_dates = set(history.keys())
+    rows_to_delete = [
+        i + 1 for i, row in enumerate(all_values)
+        if i > 0 and row and row[0] in affected_dates
+    ]
+    for ri in reversed(rows_to_delete):
+        ws.delete_rows(ri)
+
+    # Build all rows
+    all_new_rows = []
+    for date_str in sorted(history.keys()):
+        meals = history[date_str].get("meals", {})
+        for meal_key in ["breakfast", "lunch", "dinner", "other"]:
+            for item in meals.get(meal_key, []):
+                all_new_rows.append([
+                    date_str,
+                    MEAL_RU.get(meal_key, meal_key),
+                    item.get("name", ""),
+                    item.get("calories", 0),
+                    item.get("protein", 0),
+                    item.get("fat", 0),
+                    item.get("carbs", 0),
+                ])
+
+    if all_new_rows:
+        # Write in batches of 500 to avoid API limits
+        for i in range(0, len(all_new_rows), 500):
+            ws.append_rows(all_new_rows[i:i+500], value_input_option="RAW")
+
+    return jsonify({
+        "status": "ok",
+        "month": month_filter or "all",
+        "dates_processed": len(history),
+        "rows_written": len(all_new_rows),
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
