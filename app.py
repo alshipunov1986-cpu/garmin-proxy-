@@ -753,6 +753,131 @@ def fatsecret_diary():
     return jsonify(data)
 
 
+# ── NUTRITION DETAIL ──────────────────────────────────────────────────────────
+
+def _parse_fs_entries(data, date_str=None):
+    """Parse FatSecret food_entries.get response → structured meals dict."""
+    MEAL_MAP = {
+        "0": "breakfast", "1": "breakfast",   # morning snack → breakfast
+        "2": "lunch",     "3": "lunch",        # afternoon snack → lunch
+        "4": "dinner",    "5": "other",        # anytime → other
+    }
+    meals = {"breakfast": [], "lunch": [], "dinner": [], "other": []}
+
+    entries_raw = data.get("food_entries", {}).get("food_entry", [])
+    if isinstance(entries_raw, dict):
+        entries_raw = [entries_raw]  # single entry → list
+
+    for e in entries_raw:
+        meal_key = MEAL_MAP.get(str(e.get("meal", "5")), "other")
+        meals[meal_key].append({
+            "name":     e.get("food_entry_name", ""),
+            "amount":   e.get("serving_description", ""),
+            "units":    float(e.get("number_of_units", 1)),
+            "calories": int(float(e.get("calories", 0))),
+            "protein":  round(float(e.get("protein", 0)), 1),
+            "fat":      round(float(e.get("fat", 0)), 1),
+            "carbs":    round(float(e.get("carbs", 0)), 1),
+        })
+
+    all_items = [item for m in meals.values() for item in m]
+    total = {
+        "calories": sum(i["calories"] for i in all_items),
+        "protein":  round(sum(i["protein"] for i in all_items), 1),
+        "fat":      round(sum(i["fat"]     for i in all_items), 1),
+        "carbs":    round(sum(i["carbs"]   for i in all_items), 1),
+    }
+    return {"date": date_str, "meals": meals, "total": total, "source": "fatsecret_api"}
+
+
+@app.route("/nutrition-detail")
+@require_api_key
+def nutrition_detail():
+    """Return detailed food diary with individual products per meal.
+    ?date=YYYY-MM-DD (default: today)
+    Sources (priority):
+      1) FatSecret OAuth API food_entries.get  — individual items + meal grouping
+      2) PWA food_diary.json                   — individual items, no meal grouping
+      3) fatsecret_diary.json                  — meal-level aggregates only (no products)
+    """
+    date_param = request.args.get("date", datetime.date.today().isoformat())
+
+    # --- Source 1: FatSecret OAuth API (individual items + meal info) ---
+    try:
+        epoch = datetime.date(1970, 1, 1)
+        d = datetime.date.fromisoformat(date_param)
+        date_int = str((d - epoch).days)
+        data = fs_api_call("food_entries.get", {"date": date_int})
+        if data.get("food_entries"):
+            return jsonify(_parse_fs_entries(data, date_param))
+    except Exception as e:
+        app.logger.warning("FatSecret API failed for nutrition-detail: %s", e)
+
+    # --- Source 2: PWA food_diary.json (individual items, all in 'other') ---
+    try:
+        if os.path.exists(FOOD_DIARY_FILE):
+            with open(FOOD_DIARY_FILE, encoding="utf-8") as f:
+                all_diary = json.load(f)
+            day = all_diary.get(date_param, {})
+            entries = day.get("entries", [])
+            if entries:
+                meals = {"breakfast": [], "lunch": [], "dinner": [], "other": []}
+                for e in entries:
+                    per100 = e.get("per100", {})
+                    grams  = float(e.get("grams", 100))
+                    k      = grams / 100
+                    meal   = e.get("meal", "other")
+                    key    = meal if meal in meals else "other"
+                    meals[key].append({
+                        "name":     e.get("name", ""),
+                        "amount":   f"{int(grams)}г",
+                        "units":    grams,
+                        "calories": round(per100.get("calories", 0) * k),
+                        "protein":  round(per100.get("protein", 0) * k, 1),
+                        "fat":      round(per100.get("fat",     0) * k, 1),
+                        "carbs":    round(per100.get("carbs",   0) * k, 1),
+                    })
+                total = day.get("total", {})
+                return jsonify({"date": date_param, "meals": meals, "total": total, "source": "pwa"})
+    except Exception as e:
+        app.logger.warning("PWA diary failed for nutrition-detail: %s", e)
+
+    # --- Source 3: fatsecret_diary.json (meal aggregates, no individual products) ---
+    try:
+        if os.path.exists(FS_DIARY_FILE):
+            with open(FS_DIARY_FILE, encoding="utf-8") as f:
+                fs_data = json.load(f)
+            if fs_data.get("date") == date_param and fs_data.get("total"):
+                # Convert meal aggregates into placeholder items
+                raw_meals = fs_data.get("meals", {}) or {}
+                meals = {"breakfast": [], "lunch": [], "dinner": [], "other": []}
+                for meal_name, mdata in raw_meals.items():
+                    if not mdata or not mdata.get("calories"):
+                        continue
+                    key = meal_name if meal_name in meals else "other"
+                    meals[key].append({
+                        "name":     f"[{meal_name.capitalize()} total]",
+                        "amount":   "агрегат",
+                        "units":    1,
+                        "calories": int(mdata.get("calories", 0)),
+                        "protein":  round(float(mdata.get("protein", 0)), 1),
+                        "fat":      round(float(mdata.get("fat",     0)), 1),
+                        "carbs":    round(float(mdata.get("carbs",   0)), 1),
+                    })
+                return jsonify({
+                    "date":   date_param,
+                    "meals":  meals,
+                    "total":  fs_data.get("total", {}),
+                    "source": "fatsecret_ext",
+                    "note":   "Только суммарные данные по приёмам пищи. Авторизуйте FatSecret OAuth для деталей.",
+                })
+    except Exception as e:
+        app.logger.warning("fatsecret_diary failed for nutrition-detail: %s", e)
+
+    return jsonify({"date": date_param, "meals": {}, "total": {}, "source": "none",
+                    "note": "No nutrition data. Use /food PWA or authorize FatSecret OAuth."})
+
+
 # ── DEBUG TOKEN ───────────────────────────────────────────────────────────────
 @app.route("/debug-token")
 @require_api_key
