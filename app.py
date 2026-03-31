@@ -29,6 +29,8 @@ API_KEY = os.environ.get("API_KEY", "")
 GARMIN_TOKENS = os.environ.get("GARMIN_TOKENS", "")
 FATSECRET_CLIENT_ID = os.environ.get("FATSECRET_CLIENT_ID", "")
 FATSECRET_CLIENT_SECRET = os.environ.get("FATSECRET_CLIENT_SECRET", "")
+FATSECRET_CONSUMER_KEY = os.environ.get("FATSECRET_CONSUMER_KEY", "")
+FATSECRET_CONSUMER_SECRET = os.environ.get("FATSECRET_CONSUMER_SECRET", "")
 FATSECRET_USER = os.environ.get("FATSECRET_USER", "")
 FATSECRET_PASS = os.environ.get("FATSECRET_PASS", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -382,11 +384,18 @@ def all_today():
 
 
 # ── FATSECRET OAuth 2.0 Authorization Code ────────────────────────────────────
-FS_AUTHORIZE_URL = "https://oauth.fatsecret.com/connect/authorize"
-FS_TOKEN_URL     = "https://oauth.fatsecret.com/connect/token"
-FS_API_URL       = "https://platform.fatsecret.com/rest/server.api"
-FS_TOKEN_FILE    = os.path.join(os.path.dirname(__file__), "fatsecret_token.json")
-FS_CALLBACK_URL  = "https://lenovo-15.tail1309d4.ts.net/fatsecret/auth/callback"
+# OAuth 2.0 — client_credentials only (public food search, no user auth)
+FS_TOKEN_URL_2   = "https://oauth.fatsecret.com/connect/token"
+# OAuth 1.0 — user diary access (no redirect_uri pre-registration needed)
+FS_REQUEST_TOKEN_URL = "https://www.fatsecret.com/oauth/request_token"
+FS_AUTHORIZE_URL_1   = "https://www.fatsecret.com/oauth/authorize"
+FS_ACCESS_TOKEN_URL  = "https://www.fatsecret.com/oauth/access_token"
+
+FS_API_URL            = "https://platform.fatsecret.com/rest/server.api"
+FS_TOKEN_FILE         = os.path.join(os.path.dirname(__file__), "fatsecret_token.json")
+FS_REQUEST_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "fatsecret_request_token.json")
+# Callback runs on localhost — no pre-registration required for OAuth 1.0
+FS_CALLBACK_URL       = "http://localhost:5001/fatsecret/auth/callback"
 
 # client_credentials token cache (for public food search — no user login needed)
 _fs_cc_cache = {"token": None, "expires_at": 0}
@@ -397,7 +406,7 @@ def get_fs_client_token():
     if _fs_cc_cache["token"] and time.time() < _fs_cc_cache["expires_at"] - 60:
         return _fs_cc_cache["token"]
     resp = requests.post(
-        FS_TOKEN_URL,
+        FS_TOKEN_URL_2,
         data={"grant_type": "client_credentials", "scope": "basic"},
         auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
         timeout=10,
@@ -504,69 +513,84 @@ def save_fs_token(data):
 
 
 def get_fs_access_token():
-    """Return valid access token, refreshing if needed."""
+    """Return (oauth_token, oauth_token_secret) from saved OAuth 1.0 token file."""
     t = load_fs_token()
     if not t:
         raise RuntimeError("FatSecret не авторизован. Откройте /fatsecret/auth/start")
-    if time.time() > t.get("saved_at", 0) + t.get("expires_in", 3600) - 60:
-        resp = requests.post(
-            FS_TOKEN_URL,
-            data={"grant_type": "refresh_token", "refresh_token": t.get("refresh_token"),
-                  "scope": "basic"},
-            auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
-            timeout=10,
-        )
-        resp.raise_for_status()
-        new_t = resp.json()
-        save_fs_token(new_t)
-        return new_t["access_token"]
-    return t["access_token"]
+    oauth_token = t.get("oauth_token")
+    oauth_token_secret = t.get("oauth_token_secret")
+    if not oauth_token or not oauth_token_secret:
+        raise RuntimeError("FatSecret токен повреждён. Откройте /fatsecret/auth/start")
+    return oauth_token, oauth_token_secret
 
 
 def fs_api_call(method, extra_params=None):
-    token = get_fs_access_token()
+    """FatSecret API call signed with OAuth 1.0 (user diary access)."""
+    from requests_oauthlib import OAuth1Session
+    oauth_token, oauth_token_secret = get_fs_access_token()
+    oauth = OAuth1Session(
+        FATSECRET_CONSUMER_KEY,
+        client_secret=FATSECRET_CONSUMER_SECRET,
+        resource_owner_key=oauth_token,
+        resource_owner_secret=oauth_token_secret,
+    )
     params = {"method": method, "format": "json"}
     if extra_params:
         params.update(extra_params)
-    resp = requests.get(
-        FS_API_URL,
-        params=params,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=15,
-    )
+    resp = oauth.get(FS_API_URL, params=params, timeout=15)
     return resp.json()
 
 
 @app.route("/fatsecret/auth/start")
 def fatsecret_auth_start():
-    """Redirect browser to FatSecret OAuth2 authorization page."""
-    import urllib.parse
-    params = {
-        "response_type": "code",
-        "client_id": FATSECRET_CLIENT_ID,
-        "redirect_uri": FS_CALLBACK_URL,
-        "scope": "basic",
-    }
-    url = FS_AUTHORIZE_URL + "?" + urllib.parse.urlencode(params)
-    return redirect(url)
+    """Start FatSecret OAuth 1.0 authorization — redirect to FatSecret login page."""
+    from requests_oauthlib import OAuth1Session
+    if not FATSECRET_CONSUMER_KEY or not FATSECRET_CONSUMER_SECRET:
+        return jsonify({"error": "FATSECRET_CONSUMER_KEY / FATSECRET_CONSUMER_SECRET not set in .env"}), 500
+    oauth = OAuth1Session(
+        FATSECRET_CONSUMER_KEY,
+        client_secret=FATSECRET_CONSUMER_SECRET,
+        callback_uri=FS_CALLBACK_URL,
+    )
+    try:
+        fetch_response = oauth.fetch_request_token(FS_REQUEST_TOKEN_URL)
+    except Exception as e:
+        return jsonify({"error": f"Failed to get request token: {e}"}), 500
+    # Save request token secret — needed to verify callback
+    with open(FS_REQUEST_TOKEN_FILE, "w") as f:
+        json.dump(fetch_response, f)
+    authorization_url = oauth.authorization_url(FS_AUTHORIZE_URL_1)
+    return redirect(authorization_url)
 
 
 @app.route("/fatsecret/auth/callback")
 def fatsecret_auth_callback():
-    """Exchange authorization code for access+refresh tokens."""
-    code = request.args.get("code")
-    if not code:
-        return jsonify({"error": "No code in callback", "args": dict(request.args)}), 400
-    resp = requests.post(
-        FS_TOKEN_URL,
-        data={"grant_type": "authorization_code", "code": code,
-              "redirect_uri": FS_CALLBACK_URL, "scope": "basic"},
-        auth=(FATSECRET_CLIENT_ID, FATSECRET_CLIENT_SECRET),
-        timeout=10,
+    """Handle FatSecret OAuth 1.0 callback — exchange verifier for access token."""
+    from requests_oauthlib import OAuth1Session
+    if not os.path.exists(FS_REQUEST_TOKEN_FILE):
+        return jsonify({"error": "No request token found. Please visit /fatsecret/auth/start first."}), 400
+    with open(FS_REQUEST_TOKEN_FILE) as f:
+        request_token = json.load(f)
+    oauth_verifier = request.args.get("oauth_verifier")
+    oauth_token = request.args.get("oauth_token")
+    if not oauth_verifier or not oauth_token:
+        return jsonify({"error": "Missing oauth_verifier/oauth_token", "args": dict(request.args)}), 400
+    oauth = OAuth1Session(
+        FATSECRET_CONSUMER_KEY,
+        client_secret=FATSECRET_CONSUMER_SECRET,
+        resource_owner_key=oauth_token,
+        resource_owner_secret=request_token.get("oauth_token_secret"),
+        verifier=oauth_verifier,
     )
-    if resp.status_code != 200:
-        return jsonify({"error": resp.text, "status": resp.status_code}), 500
-    save_fs_token(resp.json())
+    try:
+        oauth_tokens = oauth.fetch_access_token(FS_ACCESS_TOKEN_URL)
+    except Exception as e:
+        return jsonify({"error": f"Failed to get access token: {e}"}), 500
+    save_fs_token(oauth_tokens)
+    try:
+        os.remove(FS_REQUEST_TOKEN_FILE)
+    except OSError:
+        pass
     return jsonify({"status": "ok", "message": "✅ FatSecret авторизован! Токен сохранён."})
 
 
