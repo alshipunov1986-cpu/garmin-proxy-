@@ -1649,6 +1649,14 @@ SHEET_HEADERS = [
     "day_status", "conclusion", "task_tomorrow",
 ]
 
+# Columns that are filled by n8n workflows — must NOT be overwritten with empty
+# values when save-day or the scheduler refreshes Garmin data for the same date.
+_N8N_SHEET_COLUMNS = frozenset({
+    "purine_score", "beer_ml",
+    "morning_alerts", "evening_alerts",
+    "day_status", "conclusion", "task_tomorrow",
+})
+
 ACTIVE_ISSUES_HEADERS = [
     "issue_id", "date_opened", "type", "description",
     "status", "history", "date_closed",
@@ -1811,6 +1819,25 @@ def _collect_day_data(date_str):
     return d
 
 
+def _sheet_update_preserve_n8n(ws, row_idx, row):
+    """Update row_idx in ws with row, keeping existing values for n8n-managed columns.
+
+    Garmin / FatSecret columns are always overwritten (fresh data from the API).
+    Columns listed in _N8N_SHEET_COLUMNS (morning_alerts, evening_alerts,
+    purine_score, …) are preserved if they already contain a non-empty value,
+    because those fields are filled exclusively by n8n workflows and must not
+    be wiped when the scheduler re-syncs Garmin data for the same date.
+    """
+    existing = ws.row_values(row_idx)
+    # Pad to full width so zip with SHEET_HEADERS always aligns
+    while len(existing) < len(SHEET_HEADERS):
+        existing.append("")
+    for i, header in enumerate(SHEET_HEADERS):
+        if header in _N8N_SHEET_COLUMNS and existing[i]:
+            row[i] = existing[i]   # keep existing n8n value
+    ws.update(values=[row], range_name=f"A{row_idx}", value_input_option="RAW")
+
+
 def _day_data_to_row(date_str, d):
     """Map collected data dict → sheet row list (matches SHEET_HEADERS order)."""
     return [
@@ -1871,7 +1898,7 @@ def sheets_save_day():
         row  = _day_data_to_row(date_str, data)
 
         if row_exists:
-            ws.update(values=[row], range_name=f"A{row_idx}", value_input_option="RAW")
+            _sheet_update_preserve_n8n(ws, row_idx, row)
             action = "updated"
         else:
             ws.append_row(row, value_input_option="RAW")
@@ -2296,7 +2323,7 @@ def _daily_save_to_sheets(offset_days=1):
         row  = _day_data_to_row(date_str, data)
 
         if row_exists:
-            ws.update(values=[row], range_name=f"A{row_idx}", value_input_option="RAW")
+            _sheet_update_preserve_n8n(ws, row_idx, row)
             health_action = "updated"
         else:
             ws.append_row(row, value_input_option="RAW")
