@@ -2246,17 +2246,23 @@ def sheets_update_day_fields():
         _sheet_ws = None
         ws = get_sheet()
         dates_col = ws.col_values(1)
-        try:
-            row_idx = dates_col.index(date_str) + 1
-        except ValueError:
-            return jsonify({"error": f"Date {date_str} not found in sheet"}), 404
-
         col_map = {h: i + 1 for i, h in enumerate(SHEET_HEADERS)}
         updated = {}
-        for field, value in fields.items():
-            if field in col_map:
-                ws.update_cell(row_idx, col_map[field], value)
-                updated[field] = value
+        try:
+            row_idx = dates_col.index(date_str) + 1
+            for field, value in fields.items():
+                if field in col_map:
+                    ws.update_cell(row_idx, col_map[field], value)
+                    updated[field] = value
+        except ValueError:
+            # Row for this date doesn't exist yet — create a sparse row
+            new_row = ['' for _ in SHEET_HEADERS]
+            new_row[0] = date_str  # Дата column
+            for field, value in fields.items():
+                if field in col_map:
+                    new_row[col_map[field] - 1] = value
+                    updated[field] = value
+            ws.append_row(new_row, value_input_option="RAW")
         return jsonify({"status": "ok", "date": date_str, "updated": updated})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
